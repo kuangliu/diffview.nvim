@@ -1,0 +1,8 @@
+# swap/backup artifacts
+*.swp
+*.swo
+*~
+.netrwhist
+
+# lazy.nvim local lock/state (if ever checked out into a lazy-managed dir)
+lazy-lock.json
