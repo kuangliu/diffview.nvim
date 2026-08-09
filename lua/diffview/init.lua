@@ -12,9 +12,12 @@
 --   ]] / [[                  Jump to the next / previous change hunk.
 --
 -- The diff is one pane: context lines are prefixed with a space, added lines
--- with `+` and removed with `-`, each tinted with a full-width background;
--- changed words within a line get a brighter tint, and tree-sitter highlights
--- are lifted onto the view. Long runs of unchanged lines collapse into a
+-- with `+` and removed with `-`, each tinted with a full-width background.
+-- Added/removed rows are also marked in the gutter with a vertical-bar sign
+-- taken from gitsigns' config (the same bar on both sides, gitsigns'
+-- highlights), so the view matches the editor's sign column. Changed words
+-- within a line get a brighter tint, and tree-sitter highlights are lifted
+-- onto the view. Long runs of unchanged lines collapse into a
 -- `... N unchanged lines ...` placeholder row (no folds).
 
 local M = {}
@@ -456,6 +459,47 @@ local function apply_treesitter(buf, abspath, map, oldmap, kinds, old_raw, new_r
 end
 
 --------------------------------------------------------------------------
+-- gitsigns gutter signs
+--------------------------------------------------------------------------
+-- The gutter marks added/removed rows with gitsigns' highlight groups and
+-- its configured vertical-bar glyph: both sides of a change show the same
+-- `add` sign text (like gitsigns' change/changedelete signs), with the
+-- per-side highlight so add and del rows still differ in color. If gitsigns
+-- is absent, fall back to plain +/- in the view's own tints. Resolved once
+-- per session and cached.
+local sign_cache ---@type {add:{text:string,hl:string}, del:{text:string,hl:string}}?
+local function resolve_gitsigns_signs()
+  if sign_cache then return sign_cache end
+  local loaded = pcall(require, 'gitsigns')
+  if not loaded then
+    pcall(function() require('lazy').load({ plugins = { 'gitsigns.nvim' } }) end)
+    loaded = pcall(require, 'gitsigns')
+  end
+  if loaded then
+    local signs = require('gitsigns.config').config.signs
+    if signs and signs.add and signs.delete then
+      local function sign(ty)
+        -- gitsigns names its groups GitSignsAdd / GitSignsDelete / ...
+        return {
+          text = signs[ty].text,
+          hl = 'GitSigns' .. ty:sub(1, 1):upper() .. ty:sub(2),
+        }
+      end
+      local add_s = sign('add')
+      local del_s = sign('delete')
+      del_s.text = add_s.text -- same bar for both; only the color differs
+      sign_cache = { add = add_s, del = del_s }
+      return sign_cache
+    end
+  end
+  sign_cache = {
+    add = { text = '+', hl = 'DiffViewAdd' },
+    del = { text = '-', hl = 'DiffViewDel' },
+  }
+  return sign_cache
+end
+
+--------------------------------------------------------------------------
 -- rendering
 --------------------------------------------------------------------------
 -- Define the diff highlight groups. Called from setup(), on ColorScheme, and
@@ -479,11 +523,16 @@ end
 local function setup_view_window(w)
   vim.wo[w].number = false
   vim.wo[w].relativenumber = false
-  vim.wo[w].signcolumn = 'no'
+  -- fixed-width gutter for the gitsigns-style add/delete signs ('yes' keeps
+  -- it reserved on every line, so the code never shifts when jumping hunks)
+  vim.wo[w].signcolumn = 'yes:1'
   -- statuscolumn renders each view line's real source-file line number:
   -- the new-side number for context/added lines, the old-side number for
   -- removed lines. Evaluated per screen line with v:lnum set to the row.
-  vim.wo[w].statuscolumn = '%=%{v:lua.require("diffview")._linecol()} '
+  -- `%s` draws the sign column: a non-empty statuscolumn takes over the
+  -- whole gutter area (fold + sign + number), so the gitsigns-style
+  -- add/delete signs must be requested explicitly or they never render.
+  vim.wo[w].statuscolumn = '%s%=%{v:lua.require("diffview")._linecol()} '
   -- no folding: show the whole file with all context lines expanded.
   vim.wo[w].foldenable = false
 end
@@ -600,6 +649,18 @@ local function render(buf, abspath, rel, disp, map, oldmap, kinds, counts)
         hl_group = k == 'add' and 'DiffViewAdd' or 'DiffViewDel',
         hl_eol = true,
         priority = 90,
+      })
+    end
+  end
+  -- gutter signs for added/removed rows, styled after gitsigns' own config.
+  -- Placed in the same namespace as the tints, so re-renders replace them.
+  local signs = resolve_gitsigns_signs()
+  for i, k in ipairs(kinds) do
+    if k == 'add' or k == 'del' then
+      local s = k == 'add' and signs.add or signs.del
+      vim.api.nvim_buf_set_extmark(buf, ns, offset + i - 1, 0, {
+        sign_text = s.text,
+        sign_hl_group = s.hl,
       })
     end
   end

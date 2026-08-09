@@ -7,6 +7,9 @@ Opening the view filters nvim-tree to git-dirty files and hijacks its open keys
 (`l` / `e` / `<CR>`): pressing one on a modified file shows a single-pane
 unified diff (working tree vs HEAD) — context lines prefixed with a space,
 added with `+`, removed with `-`, each tinted with a full-width background.
+Added/removed rows are also marked in the gutter with a vertical-bar sign
+taken from gitsigns' config (the same bar on both sides, with gitsigns'
+per-side highlight groups), so the view matches the editor's sign column.
 Changed words within a line get a brighter tint, tree-sitter highlights are
 lifted onto the view, and long runs of unchanged lines collapse into a
 `... N unchanged lines ...` placeholder row (no folds).
@@ -16,6 +19,9 @@ lifted onto the view, and long runs of unchanged lines collapse into a
 - Neovim ≥ 0.10
 - [nvim-tree.lua](https://github.com/nvim-tree/nvim-tree.lua)
 - A tree-sitter parser for the languages you want highlighted
+- Optional: [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim) — the
+  gutter signs use its configured text/highlights when present (falls back to
+  `+`/`-` with the view's own tints otherwise)
 
 ## Install
 
