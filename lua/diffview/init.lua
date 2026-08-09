@@ -35,6 +35,10 @@ local ts_ns = vim.api.nvim_create_namespace('diffview_ts')
 -- have their middle replaced by a placeholder row.
 local KEEP = 8
 
+-- Word-diff pairing is O(#dels * #adds) token-LCS scores; a run with more
+-- candidate pairs than this (a whole-file rewrite) keeps tints only.
+local MAX_WORD_PAIRS = 5000
+
 local OPEN_KEYS = { 'l', 'e', '<CR>' }
 
 -- Transient state, all cleared on close / on a failed open.
@@ -306,6 +310,30 @@ local function tokenize(line)
   return toks
 end
 
+-- Shared-token score between two line contents (the token LCS length), used
+-- to pair removed lines with added lines for word diffing. Tokens are short
+-- and lines shorter, so the O(m*n) DP is cheap at the hunks it runs on.
+local function token_similarity(a, b)
+  local ta, tb = tokenize(a), tokenize(b)
+  local dp = {}
+  for _ = 1, #tb do dp[#dp + 1] = 0 end
+  for i = 1, #ta do
+    local diag, prev = 0, 0 -- dp[i-1][j-1], dp[i][j-1] of the current row
+    for j = 1, #tb do
+      local up = dp[j] -- dp[i-1][j]
+      if ta[i].t == tb[j].t then
+        dp[j] = diag + 1
+      elseif up > prev then
+        dp[j] = up
+      else
+        dp[j] = prev
+      end
+      diag, prev = up, dp[j]
+    end
+  end
+  return dp[#tb] or 0
+end
+
 -- Given old/new line *content* (without the +/- sign prefix), compute the
 -- byte-column ranges of the changed words on each side. Returns:
 --   del_ranges = { {s_col0, e_col0}, ... } on the old line
@@ -550,9 +578,12 @@ local function show_in_window(buf)
 end
 
 -- Highlight the changed words within each run of adjacent removed/added lines.
--- Removed and added lines are paired positionally (del[1]↔add[1], …) and
--- word-diffed; changed words get a brighter background on top of the line tint.
--- Unpaired changed lines keep the whole-line tint only (no word highlight).
+-- The two sides of a run do not correspond positionally: a hunk that removes
+-- `import math` next to `import numpy as np` -> `import numpy as npz` would
+-- positionally pair the pure deletion with the replacement of the other line
+-- and highlight the wrong words. Instead each del/add pair is scored by its
+-- shared tokens and the best disjoint pairs are word-diffed; lines left
+-- unpaired (pure additions / deletions) keep the whole-line tint only.
 local function compute_word_diffs(buf, offset, disp, kinds)
   local i = 1
   local n = #kinds
@@ -565,26 +596,42 @@ local function compute_word_diffs(buf, offset, disp, kinds)
         if kinds[i] == 'del' then dels[#dels + 1] = i else adds[#adds + 1] = i end
         i = i + 1
       end
-      -- pair del/add lines positionally and word-diff each pair
-      for k = 1, math.min(#dels, #adds) do
-        local di, ai = dels[k], adds[k]
-        -- strip the sign prefix to get content
-        local dcontent = disp[di]:sub(2)
-        local acontent = disp[ai]:sub(2)
-        local dranges, aranges = word_diff(dcontent, acontent)
-        for _, r in ipairs(dranges) do
-          pcall(vim.api.nvim_buf_set_extmark, buf, ns, row0 + di, r[1] + 1, {
-            end_col = r[2] + 1,
-            hl_group = 'DiffViewDelBright',
-            priority = 200, -- above the line bg (100) and tree-sitter (110)
-          })
+      -- score every del/add pair by shared tokens, then greedily take the
+      -- highest-scoring disjoint pairs; pairs sharing nothing are left
+      -- unpaired. Hunks too large to score have no meaningful word
+      -- correspondence, so they keep the tints only.
+      local cand = {}
+      if #dels * #adds <= MAX_WORD_PAIRS then
+        for _, di in ipairs(dels) do
+          for _, ai in ipairs(adds) do
+            local sim = token_similarity(disp[di]:sub(2), disp[ai]:sub(2))
+            if sim > 0 then cand[#cand + 1] = { sim, di, ai } end
+          end
         end
-        for _, r in ipairs(aranges) do
-          pcall(vim.api.nvim_buf_set_extmark, buf, ns, row0 + ai, r[1] + 1, {
-            end_col = r[2] + 1,
-            hl_group = 'DiffViewAddBright',
-            priority = 200,
-          })
+      end
+      table.sort(cand, function(a, b) return a[1] > b[1] end)
+      local used_d, used_a = {}, {}
+      for _, c in ipairs(cand) do
+        if not used_d[c[2]] and not used_a[c[3]] then
+          used_d[c[2]], used_a[c[3]] = true, true
+          -- strip the sign prefix to get content
+          local dcontent = disp[c[2]]:sub(2)
+          local acontent = disp[c[3]]:sub(2)
+          local dranges, aranges = word_diff(dcontent, acontent)
+          for _, r in ipairs(dranges) do
+            pcall(vim.api.nvim_buf_set_extmark, buf, ns, row0 + c[2], r[1] + 1, {
+              end_col = r[2] + 1,
+              hl_group = 'DiffViewDelBright',
+              priority = 200, -- above the line bg (100) and tree-sitter (110)
+            })
+          end
+          for _, r in ipairs(aranges) do
+            pcall(vim.api.nvim_buf_set_extmark, buf, ns, row0 + c[3], r[1] + 1, {
+              end_col = r[2] + 1,
+              hl_group = 'DiffViewAddBright',
+              priority = 200,
+            })
+          end
         end
       end
     else
