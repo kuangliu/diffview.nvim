@@ -12,7 +12,11 @@ taken from gitsigns' config (the same bar on both sides, with gitsigns'
 per-side highlight groups), so the view matches the editor's sign column.
 Changed words within a line get a brighter tint, tree-sitter highlights are
 lifted onto the view, and long runs of unchanged lines collapse into a
-`... N unchanged lines ...` placeholder row (no folds).
+`... N unchanged lines ...` placeholder row (no folds). Changes can be
+reverted in place: `dd` on a change line removes an added line from the
+working tree or restores a removed one and jumps to the next change; `u`
+undoes the last revert (files that become clean are dropped from the tree's
+git-dirty filter, and ones that become dirty again are added back).
 
 ## Requirements
 
@@ -59,6 +63,8 @@ For a local/dev checkout, use `dir` instead of a URL:
 | `q`                | Close the view and reopen the shown source file.               |
 | `<CR>`             | Open the source file at the cursor's line.                     |
 | `]]` / `[[`        | Jump to the next / previous change hunk.                       |
+| `dd`               | Revert the change on the cursor line: an added line is deleted from the working tree, a removed line is restored; the cursor moves to the next change. |
+| `u`                | Undo the last `dd` and return the cursor to its line.          |
 
 When opening, the diff for the file currently being edited is shown first,
 falling back to the first modified file (shortest relative path). Inside the

@@ -10,6 +10,10 @@
 --   q                        Close the view and reopen the shown source file.
 --   <CR>                     Open the source file at the cursor's line.
 --   ]] / [[                  Jump to the next / previous change hunk.
+--   dd                        Revert the change on the cursor line (delete an
+--                             added line / restore a removed one), then jump
+--                             to the next change.
+--   u                         Undo the last revert and jump back to its line.
 --
 -- The diff is one pane: context lines are prefixed with a space, added lines
 -- with `+` and removed with `-`, each tinted with a full-width background.
@@ -679,6 +683,8 @@ local function create_view_buf()
   vim.keymap.set('n', '<CR>', M.jump_to_source, { buffer = buf, silent = true, desc = 'diffview: open source' })
   vim.keymap.set('n', ']]', function() M.jump_hunk(1) end, { buffer = buf, silent = true, desc = 'diffview: next change' })
   vim.keymap.set('n', '[[', function() M.jump_hunk(-1) end, { buffer = buf, silent = true, desc = 'diffview: prev change' })
+  vim.keymap.set('n', 'dd', M.revert_line, { buffer = buf, nowait = true, silent = true, desc = 'diffview: revert line change' })
+  vim.keymap.set('n', 'u', M.undo_revert, { buffer = buf, nowait = true, silent = true, desc = 'diffview: undo revert' })
 
   state.buffers[#state.buffers + 1] = buf
   vim.api.nvim_create_autocmd('BufWipeout', {
@@ -700,7 +706,8 @@ local function open_diff(abspath)
   local rel = relpath(toplevel, abspath)
 
   local disp, map, oldmap, kinds, counts, old_raw, new_raw
-  if is_binary(toplevel, rel, abspath) then
+  local binary = is_binary(toplevel, rel, abspath)
+  if binary then
     disp = { 'Binary file differs (not shown)' }
     map, oldmap, kinds, counts = {}, {}, { 'del' }, { add = 0, del = 1 }
   else
@@ -716,14 +723,232 @@ local function open_diff(abspath)
   end
 
   local buf = find_view_buf(abspath) or create_view_buf()
+  vim.b[buf].diffview_binary = binary -- blocks dd on binary files
   render(buf, abspath, rel, disp, map, oldmap, kinds, counts)
   apply_treesitter(buf, abspath, map, oldmap, kinds, old_raw, new_raw)
   show_in_window(buf)
 end
 
 --------------------------------------------------------------------------
+-- working-tree edits (dd / u)
+--------------------------------------------------------------------------
+-- Apply one line edit to the working file's line list and return the new
+-- content ('delete' removes the line at `at`, 'insert' puts `content` there,
+-- both 1-based). The current trailing newline is preserved; when a restored
+-- line lands at the END of a file that lacks one, it inherits it from the
+-- HEAD side, so the revert shows as complete instead of a lone newline diff.
+local function edit_content(ls, op, at, content, trailing_new, old_trailing, at_end)
+  if op == 'delete' then
+    table.remove(ls, at)
+  else
+    table.insert(ls, at, content)
+  end
+  local out = table.concat(ls, '\n')
+  local trailing = trailing_new
+  if not trailing and at_end and old_trailing then trailing = true end
+  if trailing and #ls > 0 then out = out .. '\n' end
+  return out
+end
+
+-- Write `content` to the working file; nil means the pre-edit file was absent
+-- (a deleted file being restored, or reverted to absent again), so remove it.
+-- Returns false after notifying when the filesystem call fails.
+local function write_working_file(abspath, content)
+  if content == nil then
+    local ok, err = os.remove(abspath)
+    if not ok then
+      vim.notify('diffview: cannot remove ' .. abspath .. ': ' .. tostring(err), vim.log.levels.ERROR)
+    end
+    return ok
+  end
+  local f, err = io.open(abspath, 'wb')
+  if not f then
+    vim.notify('diffview: cannot write ' .. abspath .. ': ' .. tostring(err), vim.log.levels.ERROR)
+    return false
+  end
+  f:write(content)
+  f:close()
+  return true
+end
+
+-- Reload open, unmodified buffers of the edited file so the revert shows up
+-- in the editor too. Buffers with unsaved changes are left alone.
+local function reload_open_buffers(abspath)
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) and not vim.bo[b].modified
+        and vim.api.nvim_buf_get_name(b) == abspath then
+      pcall(vim.api.nvim_buf_call, b, function() vim.cmd('edit!') end)
+    end
+  end
+end
+
+-- Re-scan the modified set; when the edited file's status changed (dirty ->
+-- clean or clean -> dirty), reload the tree so its git filter stays honest.
+local function refresh_modified(abspath)
+  local newmod = list_modified(state.toplevel)
+  if newmod[abspath] ~= state.modified[abspath] then
+    pcall(function() get_api().tree.reload() end)
+  end
+  state.modified = newmod
+end
+
+-- Finish a working-tree edit: refresh open buffers and the tree, then
+-- re-render the view from the new working-tree state.
+local function after_edit(abspath)
+  reload_open_buffers(abspath)
+  refresh_modified(abspath)
+  open_diff(abspath)
+end
+
+--------------------------------------------------------------------------
 -- in-buffer actions
 --------------------------------------------------------------------------
+-- dd: revert the change on the cursor line — an added line is deleted from
+-- the working file, a removed line is restored into it. The edit is written
+-- straight to disk (the view's source of truth), the view re-renders and the
+-- cursor moves to the next remaining change line. Each edit is pushed onto
+-- the buffer's undo stack as before/after content snapshots, so `u` can
+-- restore the exact prior state.
+function M.revert_line()
+  local buf = vim.api.nvim_get_current_buf()
+  local abspath = vim.b[buf].diffview_abspath
+  if not abspath or vim.b[buf].diffview_binary then
+    vim.notify('diffview: cannot revert this view', vim.log.levels.WARN)
+    return
+  end
+  local offset = vim.b[buf].diffview_offset or 0
+  local kinds = vim.b[buf].diffview_kinds
+  local row = vim.api.nvim_win_get_cursor(0)[1] - offset
+  local k = kinds and kinds[row]
+  if k ~= 'add' and k ~= 'del' then
+    vim.notify('diffview: not on a changed line', vim.log.levels.WARN)
+    return
+  end
+
+  local toplevel = state.toplevel
+  local new_raw = read_file_raw(abspath)
+  local ls = new_raw and lines(new_raw) or {}
+  local content = vim.api.nvim_buf_get_lines(buf, offset + row - 1, offset + row, false)[1]:sub(2)
+  local trailing_new = new_raw and new_raw:sub(-1) == '\n' or false
+  local function stale()
+    vim.notify('diffview: working file changed; reopen the view', vim.log.levels.WARN)
+  end
+
+  local out, entry
+  if k == 'add' then
+    -- delete the added line from the working file
+    local line = vim.b[buf].diffview_map[row]
+    if ls[line] ~= content then return stale() end
+    out = edit_content(ls, 'delete', line, nil, trailing_new, false, false)
+    entry = { kind = 'add', pos = line, content = content, old_line = nil }
+  else
+    -- restore the removed line at the new-side position of its old line:
+    -- the old-side number minus the deleted lines before it, plus the added
+    -- lines before it (a surviving old line maps to one new line, and an
+    -- added line also occupies one slot ahead of this line in the new file).
+    -- Exact for every case — including end-of-file deletions, where vim.diff
+    -- anchors the hunk at the new side's start, and del runs that follow
+    -- earlier add hunks.
+    local L = vim.b[buf].diffview_oldmap[row]
+    local dels_before, adds_before = 0, 0
+    for i = 1, row - 1 do
+      if kinds[i] == 'del' then
+        dels_before = dels_before + 1
+      elseif kinds[i] == 'add' then
+        adds_before = adds_before + 1
+      end
+    end
+    local pos = L - dels_before + adds_before
+    local at_end = pos == #ls + 1
+    -- stale-view guard: the new-side line at the insertion point must still
+    -- hold the content the view shows
+    local anchor
+    for i = 1, #kinds do
+      if vim.b[buf].diffview_map[i] == pos then anchor = i break end
+    end
+    if anchor and ls[pos] ~= vim.api.nvim_buf_get_lines(buf, offset + anchor - 1, offset + anchor, false)[1]:sub(2) then
+      return stale()
+    end
+    local old_trailing = false
+    if at_end and not trailing_new then
+      local old_raw = git_show_raw(toplevel, relpath(toplevel, abspath))
+      old_trailing = old_raw and old_raw:sub(-1) == '\n' or false
+    end
+    out = edit_content(ls, 'insert', pos, content, trailing_new, old_trailing, at_end)
+    entry = { kind = 'del', pos = pos, content = content, old_line = vim.b[buf].diffview_oldmap[row] }
+  end
+
+  if not write_working_file(abspath, out) then return end
+  entry.before = new_raw -- nil when the file was absent
+  entry.after = out
+  local stack = vim.b[buf].diffview_undo or {}
+  stack[#stack + 1] = entry
+  vim.b[buf].diffview_undo = stack
+
+  after_edit(abspath)
+
+  -- land the cursor on the next remaining change line. The re-render keeps
+  -- the cursor's line number, so scan forward from there — the row under it
+  -- may now hold the rest of the same hunk, which still counts as "next".
+  local kinds2 = vim.b[buf].diffview_kinds
+  local off2 = vim.b[buf].diffview_offset or 0
+  for i = math.max(vim.api.nvim_win_get_cursor(0)[1], off2 + 1), vim.api.nvim_buf_line_count(buf) do
+    local kk = kinds2[i - off2]
+    if kk == 'add' or kk == 'del' then
+      vim.api.nvim_win_set_cursor(0, { i, 0 })
+      break
+    end
+  end
+end
+
+-- u: reverse the most recent dd. The working file must still match the
+-- recorded after-state (otherwise the entry is stale and gets dropped); it is
+-- then restored to the exact recorded before-state. The cursor returns to
+-- the row the dd touched.
+function M.undo_revert()
+  local buf = vim.api.nvim_get_current_buf()
+  local stack = vim.b[buf].diffview_undo
+  local entry = stack and stack[#stack]
+  if not entry then
+    vim.notify('diffview: nothing to undo', vim.log.levels.INFO)
+    return
+  end
+
+  local abspath = vim.b[buf].diffview_abspath
+  if read_file_raw(abspath) ~= entry.after then
+    table.remove(stack, #stack)
+    vim.b[buf].diffview_undo = stack -- vim.b values are copies; write back
+    vim.notify('diffview: working file changed; skipping undo', vim.log.levels.WARN)
+    return
+  end
+  if not write_working_file(abspath, entry.before) then return end
+  table.remove(stack, #stack)
+  vim.b[buf].diffview_undo = stack -- vim.b values are copies; write back
+
+  after_edit(abspath)
+
+  -- return the cursor to the reverted line: an added line is back as a
+  -- context row carrying its new-side number; a removed line is a del row
+  -- again under its old-side number.
+  local kinds = vim.b[buf].diffview_kinds
+  local offset = vim.b[buf].diffview_offset or 0
+  local target
+  if entry.kind == 'add' then
+    local map = vim.b[buf].diffview_map
+    for i = 1, #map do
+      if map[i] == entry.pos then target = i break end
+    end
+  else
+    local oldmap = vim.b[buf].diffview_oldmap
+    for i = 1, #oldmap do
+      if kinds[i] == 'del' and oldmap[i] == entry.old_line then target = i break end
+    end
+  end
+  if target then
+    vim.api.nvim_win_set_cursor(0, { offset + target, 0 })
+  end
+end
+
 function M.jump_to_source()
   local buf = vim.api.nvim_get_current_buf()
   local abspath = vim.b[buf].diffview_abspath
