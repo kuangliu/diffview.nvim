@@ -96,13 +96,14 @@ local function is_binary(toplevel, rel, path)
   return false
 end
 
-local function to_lines(s)
+-- Split raw file content into lines with the same semantics as vim.diff:
+-- a trailing '\n' terminates the last line without creating an empty one,
+-- so '' is no lines, '\n' is one empty line, 'a\n' is one line. Plain
+-- vim.split with trimempty would drop that trailing empty line, and the
+-- hunk line counts from vim.diff would then index past the array.
+local function lines(s)
   if s == nil or s == '' then return {} end
-  local t = {}
-  for line in (s .. '\n'):gmatch('([^\n]*)\n') do
-    t[#t + 1] = line
-  end
-  return t
+  return vim.split(s:gsub('\n$', ''), '\n', { plain = true })
 end
 
 --------------------------------------------------------------------------
@@ -154,11 +155,21 @@ end
 -- unchanged context, so a counter would undercount and break tree-sitter
 -- mapping.
 local function build_view(old_raw, new_raw)
-  local new_lines = to_lines(new_raw)
-  local diff = vim.diff(old_raw or '', new_raw or '', { algorithm = 'histogram' })
-  if diff == '' then
+  local old_lines = lines(old_raw)
+  local new_lines = lines(new_raw)
+  -- vim.diff omits context by default, so we walk its hunks as line-index
+  -- ranges (not the unified text) and fill every unchanged gap between them
+  -- (and before/after) with context from the working file, so changes appear
+  -- in place rather than stacked together. Each hunk is
+  -- {start_old, count_old, start_new, count_new}, 1-based and inclusive.
+  local hunks = vim.diff(old_raw or '', new_raw or '', {
+    algorithm = 'histogram',
+    result_type = 'indices',
+  })
+
+  local disp, map, oldmap, kinds = {}, {}, {}, {}
+  if #hunks == 0 then
     -- identical: show the whole file as context
-    local disp, map, oldmap, kinds = {}, {}, {}, {}
     for i, l in ipairs(new_lines) do
       disp[i] = ' ' .. l
       map[i] = i
@@ -168,10 +179,6 @@ local function build_view(old_raw, new_raw)
     return disp, map, oldmap, kinds
   end
 
-  -- Show the whole file: walk the diff hunks and fill every unchanged gap
-  -- between them (and before/after) with context taken from the working file,
-  -- so changes appear in place rather than stacked together.
-  local disp, map, oldmap, kinds = {}, {}, {}, {}
   local oi, ni = 0, 0            -- 1-based cursors into old/new files
   local next_new = 1             -- next new-file line to emit as context filler
 
@@ -193,38 +200,26 @@ local function build_view(old_raw, new_raw)
     end
   end
 
-  for line in diff:gmatch('([^\n]*)\n?') do
-    if line == '' then
-      -- skip
-    elseif line:sub(1, 2) == '@@' then
-      local os, ns = line:match('@@ %-(%d+),?%d* %+(%d+),?%d* @@')
-      if os and ns then
-        local new_start = tonumber(ns)
-        -- fill unchanged lines between the previous hunk and this one
-        fill_context(new_start - 1)
-        oi, ni = tonumber(os), new_start
-      end
-    elseif line:sub(1, 3) ~= '---' and line:sub(1, 3) ~= '+++' then
-      local sign = line:sub(1, 1)
-      local rest = line:sub(2)
-      if sign == '+' then
-        disp[#disp + 1] = '+' .. rest
-        map[#disp] = ni
-        kinds[#disp] = 'add'
-        ni = ni + 1
-        next_new = ni
-      elseif sign == '-' then
-        disp[#disp + 1] = '-' .. rest
-        oldmap[#disp] = oi
-        kinds[#disp] = 'del'
-        oi = oi + 1
-      else
-        emit_ctx(ni)
-        oi = oi + 1
-        ni = ni + 1
-        next_new = ni
-      end
+  for _, h in ipairs(hunks) do
+    local os, oc, ns, nc = h[1], h[2], h[3], h[4]
+    -- fill unchanged lines between the previous hunk and this one
+    fill_context(ns - 1)
+    oi, ni = os, ns
+    for k = os, os + oc - 1 do
+      disp[#disp + 1] = '-' .. old_lines[k]
+      oldmap[#disp] = oi
+      kinds[#disp] = 'del'
+      oi = oi + 1
     end
+    for k = ns, ns + nc - 1 do
+      disp[#disp + 1] = '+' .. new_lines[k]
+      map[#disp] = ni
+      kinds[#disp] = 'add'
+      ni = ni + 1
+    end
+    -- a hunk at the file start with an empty new side (a full deletion)
+    -- leaves ni = 0; keep next_new at 1 so the trailing fill no-ops
+    next_new = math.max(ni, 1)
   end
   -- trailing context after the last hunk
   fill_context(#new_lines)
@@ -307,41 +302,6 @@ local function tokenize(line)
   return toks
 end
 
--- Longest common subsequence of old/new token texts. Returns a boolean mask
--- `inold` (old tokens kept by the LCS) and `innew` (new tokens kept).
-local function lcs_mask(old_toks, new_toks)
-  local m, n = #old_toks, #new_toks
-  -- dp[i+1][j+1] = LCS length of old[1..i] / new[1..j]
-  local dp = {}
-  for i = 0, m do dp[i] = {} end
-  for i = 0, m do
-    for j = 0, n do
-      if i == 0 or j == 0 then
-        dp[i][j] = 0
-      elseif old_toks[i].t == new_toks[j].t then
-        dp[i][j] = dp[i - 1][j - 1] + 1
-      else
-        dp[i][j] = math.max(dp[i - 1][j], dp[i][j - 1])
-      end
-    end
-  end
-  local inold, innew = {}, {}
-  local i, j = m, n
-  while i > 0 and j > 0 do
-    if old_toks[i].t == new_toks[j].t then
-      inold[i] = true
-      innew[j] = true
-      i = i - 1
-      j = j - 1
-    elseif dp[i - 1][j] >= dp[i][j - 1] then
-      i = i - 1
-    else
-      j = j - 1
-    end
-  end
-  return inold, innew
-end
-
 -- Given old/new line *content* (without the +/- sign prefix), compute the
 -- byte-column ranges of the changed words on each side. Returns:
 --   del_ranges = { {s_col0, e_col0}, ... } on the old line
@@ -350,17 +310,34 @@ end
 local function word_diff(old_content, new_content)
   local old_toks, new_toks = tokenize(old_content), tokenize(new_content)
   if #old_toks == 0 or #new_toks == 0 then return {}, {} end
-  local inold, innew = lcs_mask(old_toks, new_toks)
+
+  -- diff the tokens at line granularity: put each token on its own line
+  -- (tokens never contain '\n'), so vim.diff's index hunks are token ranges.
+  -- Both sides get a trailing '\n' so equal token lines are actually
+  -- matched: without it, an unterminated last line is never equal, and a
+  -- line like 'beta' -> 'beta X' would diff as fully changed.
+  local function join(toks)
+    local parts = {}
+    for _, tk in ipairs(toks) do parts[#parts + 1] = tk.t end
+    return table.concat(parts, '\n') .. '\n'
+  end
+  local hunks = vim.diff(join(old_toks), join(new_toks), { result_type = 'indices' })
+  local old_chg, new_chg = {}, {} -- changed-token index sets
+  for _, h in ipairs(hunks) do
+    for k = h[1], h[1] + h[2] - 1 do old_chg[k] = true end
+    for k = h[3], h[3] + h[4] - 1 do new_chg[k] = true end
+  end
+
+  -- merge consecutive changed non-whitespace tokens into one range each
   local del_ranges, add_ranges = {}, {}
-  -- merge consecutive changed tokens into one range each
-  local function push(out, toks, keep)
+  local function push(out, toks, chg)
     local run ---@type {s:number,e:number}?
     local function flush()
       if run then out[#out + 1] = { run.s, run.e }; run = nil end
     end
     for idx = 1, #toks do
       local tk = toks[idx]
-      if not keep[idx] and tk.t:match('%S') then -- skip pure-whitespace tokens
+      if chg[idx] and tk.t:match('%S') then -- skip pure-whitespace tokens
         local s, e = tk.s - 1, tk.e -- 0-based start, exclusive end
         if run and s == run.e then run.e = e
         else flush(); run = { s = s, e = e } end
@@ -370,8 +347,8 @@ local function word_diff(old_content, new_content)
     end
     flush()
   end
-  push(del_ranges, old_toks, inold)
-  push(add_ranges, new_toks, innew)
+  push(del_ranges, old_toks, old_chg)
+  push(add_ranges, new_toks, new_chg)
   return del_ranges, add_ranges
 end
 
@@ -391,8 +368,8 @@ end
 --   { {row0, col0, row1, col1, capture_name}, ... }
 -- Returns nil if the language has no parser or highlights query.
 local function parse_captures(lang, content)
-  local lines = to_lines(content)
-  if #lines == 0 then return nil end
+  local ls = lines(content)
+  if #ls == 0 then return nil end
   local scratch = vim.api.nvim_create_buf(false, true)
   local caps
   local ok = pcall(function()
