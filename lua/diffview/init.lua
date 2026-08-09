@@ -591,10 +591,14 @@ local function render(buf, abspath, rel, disp, map, oldmap, kinds, counts)
       -- renders OVER inline ranges regardless of priority, so the brighter
       -- changed-word extmark could never show through. Two inline hl_groups
       -- compose by priority, letting the word highlight win on its columns.
-      local len = #disp[i]
+      -- End the range on the NEXT line (end_row = row + 1, end_col = 0) so it
+      -- covers this line's EOL; hl_eol then extends the tint to the end of
+      -- the screen line (GitHub style) instead of stopping at the text.
       vim.api.nvim_buf_set_extmark(buf, ns, offset + i - 1, 0, {
-        end_col = len,
+        end_row = offset + i,
+        end_col = 0,
         hl_group = k == 'add' and 'DiffViewAdd' or 'DiffViewDel',
+        hl_eol = true,
         priority = 90,
       })
     end
