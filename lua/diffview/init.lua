@@ -89,7 +89,7 @@ local function is_binary(toplevel, rel, path)
   if out[1] and out[1]:match('^%-%s+%-%s') then return true end
   -- untracked: scan the working file for NUL bytes
   local raw = read_file_raw(path)
-  if raw and raw:find('%z', 1, true) then return true end
+  if raw and raw:find('%z') then return true end
   return false
 end
 
