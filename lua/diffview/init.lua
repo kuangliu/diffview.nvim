@@ -41,6 +41,20 @@ local MAX_WORD_PAIRS = 5000
 
 local OPEN_KEYS = { 'l', 'e', '<CR>' }
 
+-- A single view row. One list of these replaces the old parallel
+-- disp/map/oldmap/kinds arrays, so there is no nil-in-array juggling.
+---@class diffview.Row
+---@field text string  view line, already prefixed ' '/'+'/'-'
+---@field kind 'ctx'|'add'|'del'|'sep'
+---@field newln integer|nil new-side source line (1-based) for ctx/add
+---@field oldln integer|nil old-side source line (1-based) for ctx/del
+-- Plain table rows: every field is accessed directly (no methods), and vim.b
+-- deep-copies b-vars without preserving metatables, so a class would be
+-- stripped on the buffer round-trip anyway.
+local function row(text, kind, newln, oldln)
+  return { text = text, kind = kind, newln = newln, oldln = oldln }
+end
+
 -- Transient state, all cleared on close / on a failed open.
 local state = {
   active = false,
@@ -60,24 +74,26 @@ local function git_toplevel()
   return out[1]
 end
 
-local function list_modified(toplevel)
-  local set = {}
-  local function add(args)
-    for _, f in ipairs(vim.fn.systemlist(args)) do
-      if f ~= '' then set[toplevel .. '/' .. f] = true end
-    end
-  end
-  -- tracked: working tree vs HEAD (staged + unstaged, including deletions)
-  add({ 'git', '-C', toplevel, 'diff', '--name-only', 'HEAD' })
-  -- untracked
-  add({ 'git', '-C', toplevel, 'ls-files', '--others', '--exclude-standard' })
-  return set
-end
-
 local function relpath(toplevel, path)
   local prefix = toplevel .. '/'
   if path:sub(1, #prefix) == prefix then return path:sub(#prefix + 1) end
   return path
+end
+
+local function list_modified(toplevel)
+  local set = {}
+  -- tracked: working tree vs HEAD (staged + unstaged, including deletions)
+  -- plus untracked, collected in one pass.
+  local cmds = {
+    { 'git', '-C', toplevel, 'diff', '--name-only', 'HEAD' },
+    { 'git', '-C', toplevel, 'ls-files', '--others', '--exclude-standard' },
+  }
+  for _, args in ipairs(cmds) do
+    for _, f in ipairs(vim.fn.systemlist(args)) do
+      if f ~= '' then set[toplevel .. '/' .. f] = true end
+    end
+  end
+  return set
 end
 
 local function read_file_raw(path)
@@ -152,54 +168,40 @@ end
 --------------------------------------------------------------------------
 -- Build a full-file view: every line of the new file is shown (so changes are
 -- not stacked together), with added/removed lines interleaved in place.
--- `vim.diff` omits context by default, so we walk its hunks and fill the
--- unchanged gaps between them from the working file.
---
---   disp[i]    = view line, prefixed ' ' (ctx), '+' (add) or '-' (del)
---   map[i]     = 1-based new-side line number (ctx/add); nil for del
---   oldmap[i]  = 1-based old-side line number (ctx/del); nil for add
---   kinds[i]   = 'ctx' | 'add' | 'del'
--- Line numbers come from the @@ hunk headers (not a counter): vim.diff omits
--- unchanged context, so a counter would undercount and break tree-sitter
--- mapping.
+-- `vim.diff` omits context by default, so we walk its hunks as line-index
+-- ranges and fill the unchanged gaps between them from the working file.
+-- Each hunk is {start_old, count_old, start_new, count_new}, 1-based and
+-- inclusive. Returns Row[] and add/del counts.
 local function build_view(old_raw, new_raw)
   local old_lines = lines(old_raw)
   local new_lines = lines(new_raw)
-  -- vim.diff omits context by default, so we walk its hunks as line-index
-  -- ranges (not the unified text) and fill every unchanged gap between them
-  -- (and before/after) with context from the working file, so changes appear
-  -- in place rather than stacked together. Each hunk is
-  -- {start_old, count_old, start_new, count_new}, 1-based and inclusive.
   local hunks = vim.diff(old_raw or '', new_raw or '', {
     algorithm = 'histogram',
     result_type = 'indices',
   })
 
-  local disp, map, oldmap, kinds = {}, {}, {}, {}
+  local rows = {}
+  local counts = { add = 0, del = 0 }
+
   if #hunks == 0 then
     -- identical: show the whole file as context
     for i, l in ipairs(new_lines) do
-      disp[i] = ' ' .. l
-      map[i] = i
-      oldmap[i] = i
-      kinds[i] = 'ctx'
+      rows[i] = row(' ' .. l, 'ctx', i, i)
     end
-    return disp, map, oldmap, kinds
+    return rows, counts
   end
 
   local oi, ni = 0, 0            -- 1-based cursors into old/new files
   local next_new = 1             -- next new-file line to emit as context filler
 
+  -- Emit unchanged new-file line `n` as a context row. The old-side line is
+  -- derived from the current old/new cursor delta (they advance together for
+  -- context, so old = new - (new_so_far - old_so_far)).
   local function emit_ctx(n)
-    -- emit new-file line n (1-based) as a context line
-    disp[#disp + 1] = ' ' .. new_lines[n]
-    map[#disp] = n
-    oldmap[#disp] = n - (ni - oi) -- old-side equivalent line
-    kinds[#disp] = 'ctx'
+    rows[#rows + 1] = row(' ' .. new_lines[n], 'ctx', n, n - (ni - oi))
   end
 
   local function fill_context(upto_new)
-    -- emit unchanged new-file lines next_new..upto_new (inclusive)
     while next_new <= upto_new do
       emit_ctx(next_new)
       ni = ni + 1
@@ -210,80 +212,54 @@ local function build_view(old_raw, new_raw)
 
   for _, h in ipairs(hunks) do
     local os, oc, ns, nc = h[1], h[2], h[3], h[4]
-    -- fill unchanged lines between the previous hunk and this one
     fill_context(ns - 1)
     oi, ni = os, ns
     for k = os, os + oc - 1 do
-      disp[#disp + 1] = '-' .. old_lines[k]
-      oldmap[#disp] = oi
-      kinds[#disp] = 'del'
+      rows[#rows + 1] = row('-' .. old_lines[k], 'del', nil, oi)
       oi = oi + 1
+      counts.del = counts.del + 1
     end
     for k = ns, ns + nc - 1 do
-      disp[#disp + 1] = '+' .. new_lines[k]
-      map[#disp] = ni
-      kinds[#disp] = 'add'
+      rows[#rows + 1] = row('+' .. new_lines[k], 'add', ni)
       ni = ni + 1
+      counts.add = counts.add + 1
     end
     -- a hunk at the file start with an empty new side (a full deletion)
     -- leaves ni = 0; keep next_new at 1 so the trailing fill no-ops
     next_new = math.max(ni, 1)
   end
-  -- trailing context after the last hunk
   fill_context(#new_lines)
-  return disp, map, oldmap, kinds
+  return rows, counts
 end
 
 -- Replace the middle of long runs of unchanged lines with a single placeholder
--- row (kind 'sep'), keeping KEEP context lines on each side of a change. This
--- hides unrelated code without using folds: the omitted lines simply don't
--- exist in the view, replaced by a `... N unchanged ...` marker. The map/
--- oldmap/kinds arrays are rebuilt in lockstep with disp.
-local function collapse_context(disp, map, oldmap, kinds)
-  -- `map`/`oldmap` are sparse: del rows have map=nil, add rows have
-  -- oldmap=nil. Assigning nil with `t[#t+1] = nil` would NOT extend the array
-  -- (the length operator stalls on holes), corrupting every subsequent index.
-  -- So append with an explicit counter and store `false` as the sentinel for
-  -- "no line on this side" — readers compare against nil/falsy, and the array
-  -- stays dense so ipairs(disp)/ipairs(kinds) keep lining up.
-  local nd, nm, nom, nk = {}, {}, {}, {}
-  local o = 0 -- output row count (1-based); use this instead of #t
-  local function push(d, m, om, k)
-    o = o + 1
-    nd[o] = d
-    nm[o] = m or false
-    nom[o] = om or false
-    nk[o] = k
-  end
-  local i, n = 1, #disp
+-- row, keeping KEEP context lines on each side of a change. The omitted lines
+-- simply don't exist in the view — no folds. With Row objects the arrays stay
+-- dense (no nil holes), so a plain append preserves every index.
+local function collapse_context(rows)
+  local out = {}
+  local n = #rows
+  local i = 1
   while i <= n do
-    if kinds[i] == 'ctx' then
-      -- find the full run of context
+    if rows[i].kind == 'ctx' then
       local j = i
-      while j + 1 <= n and kinds[j + 1] == 'ctx' do j = j + 1 end
+      while j + 1 <= n and rows[j + 1].kind == 'ctx' do j = j + 1 end
       local len = j - i + 1
       if len > 2 * KEEP + 1 then
-        -- keep KEEP at the start, placeholder, keep KEEP at the end
-        for k = i, i + KEEP - 1 do
-          push(disp[k], map[k], oldmap[k], 'ctx')
-        end
+        for k = i, i + KEEP - 1 do out[#out + 1] = rows[k] end
         local hidden = len - 2 * KEEP
-        push(string.format(' ... %d unchanged lines ...', hidden), nil, nil, 'sep')
-        for k = j - KEEP + 1, j do
-          push(disp[k], map[k], oldmap[k], 'ctx')
-        end
+        out[#out + 1] = row(string.format(' ... %d unchanged lines ...', hidden), 'sep')
+        for k = j - KEEP + 1, j do out[#out + 1] = rows[k] end
       else
-        for k = i, j do
-          push(disp[k], map[k], oldmap[k], 'ctx')
-        end
+        for k = i, j do out[#out + 1] = rows[k] end
       end
       i = j + 1
     else
-      push(disp[i], map[i], oldmap[i], kinds[i])
+      out[#out + 1] = rows[i]
       i = i + 1
     end
   end
-  return nd, nm, nom, nk
+  return out
 end
 
 --------------------------------------------------------------------------
@@ -293,9 +269,8 @@ end
 -- offsets map exactly to buffer columns. Words are identifier-ish runs; the
 -- rest (punctuation, whitespace) are passed through as separate tokens.
 local function tokenize(line)
-  local toks = {} ---@type {s:number,e:number}[] 1-based inclusive byte cols
-  local i = 1
-  local n = #line
+  local toks = {} ---@type {s:number,e:number,t:string}[] 1-based inclusive byte cols
+  local i, n = 1, #line
   while i <= n do
     local word = line:match('^[%w_]+', i)
     if word then
@@ -360,21 +335,33 @@ local function word_diff(old_content, new_content)
     for k = h[3], h[3] + h[4] - 1 do new_chg[k] = true end
   end
 
-  -- merge consecutive changed non-whitespace tokens into one range each
+  -- Merge changed tokens into spans. A span grows through whitespace, so several
+-- changed words in one line merge into a single contiguous block (the space
+-- between them is highlighted too, e.g. `foo bar` -> `qux baz`). Any unchanged
+-- non-whitespace token (a kept punctuation, an untouched word) breaks the run.
   local del_ranges, add_ranges = {}, {}
   local function push(out, toks, chg)
     local run ---@type {s:number,e:number}?
+    local bridge ---@type {s:number,e:number}? -- pending whitespace connecting to next word
     local function flush()
-      if run then out[#out + 1] = { run.s, run.e }; run = nil end
+      if run then out[#out + 1] = { run.s, run.e } end
+      run, bridge = nil, nil
     end
     for idx = 1, #toks do
       local tk = toks[idx]
-      if chg[idx] and tk.t:match('%S') then -- skip pure-whitespace tokens
-        local s, e = tk.s - 1, tk.e -- 0-based start, exclusive end
-        if run and s == run.e then run.e = e
-        else flush(); run = { s = s, e = e } end
-      else
-        flush()
+      if tk.t:match('%S') then
+        if chg[idx] then
+          local s, e = tk.s - 1, tk.e -- 0-based start, exclusive end
+          if bridge then run.e = bridge.e; bridge = nil end
+          if run and s <= run.e then run.e = e
+          else flush(); run = { s = s, e = e } end
+        else
+          flush() -- an unchanged character ends the block; bridge (whitespace) is reset too
+        end
+      elseif run then
+        -- whitespace between changed words: remember it so the next changed
+        -- word glues onto this run, highlighting the space in between too
+        bridge = { s = tk.s - 1, e = tk.e } -- keep the last span of a space run
       end
     end
     flush()
@@ -382,6 +369,56 @@ local function word_diff(old_content, new_content)
   push(del_ranges, old_toks, old_chg)
   push(add_ranges, new_toks, new_chg)
   return del_ranges, add_ranges
+end
+
+-- Highlight the changed words within each run of adjacent removed/added lines.
+-- Only runs with a clean line count match (1:1 or 2:2) are word-diffed, so the
+-- two sides line up positionally and the highlighted words stay trustworthy;
+-- everything else (a pure insertion, a 3:2 mix, a whole-block rewrite) keeps
+-- the whole-line tint only.
+local function compute_word_diffs(buf, offset, rows)
+  local n = #rows
+  local row0 = offset - 1 -- 0-based buffer row of rows[1]
+  local i = 1
+  local function hl_pair(di, ai)
+    local dcontent = rows[di].text:sub(2)
+    local acontent = rows[ai].text:sub(2)
+    if token_similarity(dcontent, acontent) == 0 then return end
+    local dranges, aranges = word_diff(dcontent, acontent)
+    for _, r in ipairs(dranges) do
+      pcall(vim.api.nvim_buf_set_extmark, buf, ns, row0 + di, r[1] + 1, {
+        end_col = r[2] + 1,
+        hl_group = 'DiffViewDelBright',
+        priority = 200, -- above the line bg (100) and tree-sitter (110)
+      })
+    end
+    for _, r in ipairs(aranges) do
+      pcall(vim.api.nvim_buf_set_extmark, buf, ns, row0 + ai, r[1] + 1, {
+        end_col = r[2] + 1,
+        hl_group = 'DiffViewAddBright',
+        priority = 200,
+      })
+    end
+  end
+  while i <= n do
+    local kind = rows[i].kind
+    if kind == 'del' or kind == 'add' then
+      -- gather one contiguous changed run
+      local dels, adds = {}, {}
+      while i <= n and (rows[i].kind == 'del' or rows[i].kind == 'add') do
+        if rows[i].kind == 'del' then dels[#dels + 1] = i else adds[#adds + 1] = i end
+        i = i + 1
+      end
+      -- only a clean positional match (1:1 or 2:2) lines the two sides up
+      -- well enough for word diffing; otherwise skip to whole-line tints.
+      local k = #dels
+      if k == #adds and (k == 1 or k == 2) and k * k <= MAX_WORD_PAIRS then
+        for p = 1, k do hl_pair(dels[p], adds[p]) end
+      end
+    else
+      i = i + 1
+    end
+  end
 end
 
 --------------------------------------------------------------------------
@@ -405,7 +442,7 @@ local function parse_captures(lang, content)
   local scratch = vim.api.nvim_create_buf(false, true)
   local caps
   local ok = pcall(function()
-    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, lines)
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, ls)
     local parser = vim.treesitter.get_parser(scratch, lang)
     local tree = parser:parse()[1]
     local query = vim.treesitter.query.get(lang, 'highlights')
@@ -421,17 +458,17 @@ local function parse_captures(lang, content)
   return caps
 end
 
+-- side_line (1-based) -> 0-based view row, for the given side.
 local function highlight_side(buf, caps, line_map, offset)
   if not caps then return end
   for _, c in ipairs(caps) do
     local sr, sc, er, ec, name = c[1], c[2], c[3], c[4], c[5]
     local view_line = line_map[sr + 1] -- side lines are 1-based in line_map
     if view_line then
-      local row = offset + view_line -- 0-based extmark row
       -- multi-line captures: only highlight the first line segment for simplicity
       if sr == er then
-        pcall(vim.api.nvim_buf_set_extmark, buf, ts_ns, row, sc + 1, {
-          end_row = row,
+        pcall(vim.api.nvim_buf_set_extmark, buf, ts_ns, offset + view_line, sc + 1, {
+          end_row = offset + view_line,
           end_col = ec + 1,
           hl_group = '@' .. name,
           priority = 110, -- above the line background (default 100)
@@ -441,28 +478,30 @@ local function highlight_side(buf, caps, line_map, offset)
   end
 end
 
-local function apply_treesitter(buf, abspath, map, oldmap, kinds, old_raw, new_raw)
+-- Build side_line -> 0-based view row maps from the view rows, then lift
+-- tree-sitter captures from both sides. Context lines are highlighted from
+-- the new side only; del lines from the old side (avoids stacking duplicate
+-- extmarks on every context line).
+local function apply_treesitter(buf, abspath, rows, old_raw, new_raw)
   vim.api.nvim_buf_clear_namespace(buf, ts_ns, 0, -1)
   local offset = vim.b[buf].diffview_offset or 0
   local lang = lang_for_path(abspath)
   if not lang then return end
 
-  -- new side (ctx + add lines): highlight from the working file
-  if new_raw and new_raw ~= '' then
-    local new_rev = {}
-    for i, n in pairs(map or {}) do
-      if n then new_rev[n] = i - 1 end
+  local new_rev, del_rev = {}, {} -- side_line(1-based) -> 0-based view row
+  for i, r in ipairs(rows) do
+    if r.kind == 'add' or r.kind == 'ctx' then
+      if r.newln then new_rev[r.newln] = i - 1 end
     end
-    highlight_side(buf, parse_captures(lang, new_raw), new_rev, offset)
+    if r.kind == 'del' and r.oldln then
+      del_rev[r.oldln] = i - 1
+    end
   end
 
-  -- old side (del lines only; ctx was already highlighted from the new side,
-  -- so skip it to avoid stacking duplicate extmarks on every context line)
+  if new_raw and new_raw ~= '' then
+    highlight_side(buf, parse_captures(lang, new_raw), new_rev, offset)
+  end
   if old_raw and old_raw ~= '' then
-    local del_rev = {}
-    for i, o in pairs(oldmap or {}) do
-      if o and kinds and kinds[i] == 'del' then del_rev[o] = i - 1 end
-    end
     highlight_side(buf, parse_captures(lang, old_raw), del_rev, offset)
   end
 end
@@ -577,128 +616,56 @@ local function show_in_window(buf)
   setup_view_window(target)
 end
 
--- Highlight the changed words within each run of adjacent removed/added lines.
--- The two sides of a run do not correspond positionally: a hunk that removes
--- `import math` next to `import numpy as np` -> `import numpy as npz` would
--- positionally pair the pure deletion with the replacement of the other line
--- and highlight the wrong words. Instead each del/add pair is scored by its
--- shared tokens and the best disjoint pairs are word-diffed; lines left
--- unpaired (pure additions / deletions) keep the whole-line tint only.
-local function compute_word_diffs(buf, offset, disp, kinds)
-  local i = 1
-  local n = #kinds
-  local row0 = offset - 1 -- 0-based buffer row of disp[1]
-  while i <= n do
-    if kinds[i] == 'del' or kinds[i] == 'add' then
-      -- gather one contiguous changed run
-      local dels, adds = {}, {}
-      while i <= n and (kinds[i] == 'del' or kinds[i] == 'add') do
-        if kinds[i] == 'del' then dels[#dels + 1] = i else adds[#adds + 1] = i end
-        i = i + 1
-      end
-      -- score every del/add pair by shared tokens, then greedily take the
-      -- highest-scoring disjoint pairs; pairs sharing nothing are left
-      -- unpaired. Hunks too large to score have no meaningful word
-      -- correspondence, so they keep the tints only.
-      local cand = {}
-      if #dels * #adds <= MAX_WORD_PAIRS then
-        for _, di in ipairs(dels) do
-          for _, ai in ipairs(adds) do
-            local sim = token_similarity(disp[di]:sub(2), disp[ai]:sub(2))
-            if sim > 0 then cand[#cand + 1] = { sim, di, ai } end
-          end
-        end
-      end
-      table.sort(cand, function(a, b) return a[1] > b[1] end)
-      local used_d, used_a = {}, {}
-      for _, c in ipairs(cand) do
-        if not used_d[c[2]] and not used_a[c[3]] then
-          used_d[c[2]], used_a[c[3]] = true, true
-          -- strip the sign prefix to get content
-          local dcontent = disp[c[2]]:sub(2)
-          local acontent = disp[c[3]]:sub(2)
-          local dranges, aranges = word_diff(dcontent, acontent)
-          for _, r in ipairs(dranges) do
-            pcall(vim.api.nvim_buf_set_extmark, buf, ns, row0 + c[2], r[1] + 1, {
-              end_col = r[2] + 1,
-              hl_group = 'DiffViewDelBright',
-              priority = 200, -- above the line bg (100) and tree-sitter (110)
-            })
-          end
-          for _, r in ipairs(aranges) do
-            pcall(vim.api.nvim_buf_set_extmark, buf, ns, row0 + c[3], r[1] + 1, {
-              end_col = r[2] + 1,
-              hl_group = 'DiffViewAddBright',
-              priority = 200,
-            })
-          end
-        end
-      end
-    else
-      i = i + 1
-    end
+-- Paint a single view row's line tint and gutter sign. `sep` rows get a
+-- muted full-line tint; `add`/`del` rows get the sign + an INLINE hl_group
+-- spanning the whole line (NOT line_hl_group): line_hl_group draws at the
+-- line-fill layer and renders OVER inline ranges regardless of priority, so
+-- the brighter changed-word extmark could never show through. Two inline
+-- hl_groups compose by priority, letting the word highlight win on its
+-- columns. End the range on the NEXT line (end_row = row + 1, end_col = 0)
+-- so it covers this line's EOL; hl_eol then extends the tint to the end of
+-- the screen line (GitHub style) instead of stopping at the text.
+local function place_row_marks(buf, r, view_row)
+  if r.kind == 'sep' then
+    vim.api.nvim_buf_set_extmark(buf, ns, view_row, 0, { line_hl_group = 'DiffViewSep' })
+    return
   end
+  if r.kind ~= 'add' and r.kind ~= 'del' then return end
+  vim.api.nvim_buf_set_extmark(buf, ns, view_row, 0, {
+    end_row = view_row + 1,
+    end_col = 0,
+    hl_group = r.kind == 'add' and 'DiffViewAdd' or 'DiffViewDel',
+    hl_eol = true,
+    priority = 90,
+  })
+  local s = resolve_gitsigns_signs()[r.kind]
+  vim.api.nvim_buf_set_extmark(buf, ns, view_row, 0, {
+    sign_text = s.text,
+    sign_hl_group = s.hl,
+  })
 end
 
-local function render(buf, abspath, rel, disp, map, oldmap, kinds, counts)
+local function render(buf, abspath, rel, rows, counts)
   define_highlights() -- ensure diff highlight groups exist before drawing
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
 
-  local lines = {
+  local out = {
     string.format('%s   +%d -%d', rel, counts.add, counts.del),
     '',
   }
-  local offset = #lines -- 1-based count of header lines
-  for _, l in ipairs(disp) do
-    lines[#lines + 1] = l
-  end
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  for _, r in ipairs(rows) do out[#out + 1] = r.text end
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, out)
 
+  local offset = #out - #rows -- header lines preceding the first view row
   vim.api.nvim_buf_set_extmark(buf, ns, 0, 0, { line_hl_group = 'DiffViewHeader' })
-  for i, k in ipairs(kinds) do
-    if k == 'sep' then
-      -- placeholder for hidden unchanged lines: muted full-line tint
-      vim.api.nvim_buf_set_extmark(buf, ns, offset + i - 1, 0, {
-        line_hl_group = 'DiffViewSep',
-      })
-    elseif k ~= 'ctx' then
-      -- Paint the line tint as an INLINE hl_group spanning the whole line
-      -- (NOT line_hl_group): line_hl_group draws at the line-fill layer and
-      -- renders OVER inline ranges regardless of priority, so the brighter
-      -- changed-word extmark could never show through. Two inline hl_groups
-      -- compose by priority, letting the word highlight win on its columns.
-      -- End the range on the NEXT line (end_row = row + 1, end_col = 0) so it
-      -- covers this line's EOL; hl_eol then extends the tint to the end of
-      -- the screen line (GitHub style) instead of stopping at the text.
-      vim.api.nvim_buf_set_extmark(buf, ns, offset + i - 1, 0, {
-        end_row = offset + i,
-        end_col = 0,
-        hl_group = k == 'add' and 'DiffViewAdd' or 'DiffViewDel',
-        hl_eol = true,
-        priority = 90,
-      })
-    end
+  for i, r in ipairs(rows) do
+    place_row_marks(buf, r, offset + i - 1) -- 0-based extmark row
   end
-  -- gutter signs for added/removed rows, styled after gitsigns' own config.
-  -- Placed in the same namespace as the tints, so re-renders replace them.
-  local signs = resolve_gitsigns_signs()
-  for i, k in ipairs(kinds) do
-    if k == 'add' or k == 'del' then
-      local s = k == 'add' and signs.add or signs.del
-      vim.api.nvim_buf_set_extmark(buf, ns, offset + i - 1, 0, {
-        sign_text = s.text,
-        sign_hl_group = s.hl,
-      })
-    end
-  end
-  -- brighter highlights on the changed words within each +/- run
-  compute_word_diffs(buf, offset, disp, kinds)
+  compute_word_diffs(buf, offset, rows)
 
   vim.bo[buf].modifiable = false
-  vim.b[buf].diffview_map = map
-  vim.b[buf].diffview_oldmap = oldmap
-  vim.b[buf].diffview_kinds = kinds
+  vim.b[buf].diffview_rows = rows
   vim.b[buf].diffview_abspath = abspath
   vim.b[buf].diffview_offset = offset
 end
@@ -723,25 +690,25 @@ local function create_view_buf()
   vim.bo[buf].swapfile = false
   pcall(vim.api.nvim_buf_set_name, buf, 'diffview://' .. buf)
 
-  vim.keymap.set('n', 'q', function()
-    -- close the view; close() reopens the shown source file in this window
-    M.close()
-  end, { buffer = buf, silent = true, desc = 'diffview: close and open source' })
-  vim.keymap.set('n', '<CR>', M.jump_to_source, { buffer = buf, silent = true, desc = 'diffview: open source' })
-  vim.keymap.set('n', ']]', function() M.jump_hunk(1) end, { buffer = buf, silent = true, desc = 'diffview: next change' })
-  vim.keymap.set('n', '[[', function() M.jump_hunk(-1) end, { buffer = buf, silent = true, desc = 'diffview: prev change' })
-  vim.keymap.set('n', 'dd', M.revert_line, { buffer = buf, nowait = true, silent = true, desc = 'diffview: revert line change' })
-  vim.keymap.set('n', 'u', M.undo_revert, { buffer = buf, nowait = true, silent = true, desc = 'diffview: undo revert' })
+  vim.keymap.set('n', 'q', M.close,
+    { buffer = buf, silent = true, desc = 'diffview: close and open source' })
+  vim.keymap.set('n', '<CR>', M.jump_to_source,
+    { buffer = buf, silent = true, desc = 'diffview: open source' })
+  vim.keymap.set('n', ']]', function() M.jump_hunk(1) end,
+    { buffer = buf, silent = true, desc = 'diffview: next change' })
+  vim.keymap.set('n', '[[', function() M.jump_hunk(-1) end,
+    { buffer = buf, silent = true, desc = 'diffview: prev change' })
+  vim.keymap.set('n', 'dd', M.revert_line,
+    { buffer = buf, nowait = true, silent = true, desc = 'diffview: revert line change' })
+  vim.keymap.set('n', 'u', M.undo_revert,
+    { buffer = buf, nowait = true, silent = true, desc = 'diffview: undo revert' })
 
   state.buffers[#state.buffers + 1] = buf
   vim.api.nvim_create_autocmd('BufWipeout', {
     buffer = buf,
     callback = function()
       for i, b in ipairs(state.buffers) do
-        if b == buf then
-          table.remove(state.buffers, i)
-          break
-        end
+        if b == buf then table.remove(state.buffers, i); break end
       end
     end,
   })
@@ -752,27 +719,22 @@ local function open_diff(abspath)
   local toplevel = state.toplevel
   local rel = relpath(toplevel, abspath)
 
-  local disp, map, oldmap, kinds, counts, old_raw, new_raw
+  local rows, counts, old_raw, new_raw
   local binary = is_binary(toplevel, rel, abspath)
   if binary then
-    disp = { 'Binary file differs (not shown)' }
-    map, oldmap, kinds, counts = {}, {}, { 'del' }, { add = 0, del = 1 }
+    rows = { row('Binary file differs (not shown)', 'del', nil, 1) }
+    counts = { add = 0, del = 1 }
   else
     old_raw = git_show_raw(toplevel, rel) -- nil for untracked files
     new_raw = read_file_raw(abspath)      -- nil for deleted files
-    disp, map, oldmap, kinds = build_view(old_raw, new_raw)
-    disp, map, oldmap, kinds = collapse_context(disp, map, oldmap, kinds)
-    counts = { add = 0, del = 0 }
-    for _, k in ipairs(kinds) do
-      if k == 'add' then counts.add = counts.add + 1 end
-      if k == 'del' then counts.del = counts.del + 1 end
-    end
+    rows, counts = build_view(old_raw, new_raw)
+    rows = collapse_context(rows)
   end
 
   local buf = find_view_buf(abspath) or create_view_buf()
   vim.b[buf].diffview_binary = binary -- blocks dd on binary files
-  render(buf, abspath, rel, disp, map, oldmap, kinds, counts)
-  apply_treesitter(buf, abspath, map, oldmap, kinds, old_raw, new_raw)
+  render(buf, abspath, rel, rows, counts)
+  apply_treesitter(buf, abspath, rows, old_raw, new_raw)
   show_in_window(buf)
 end
 
@@ -847,9 +809,71 @@ local function after_edit(abspath)
   open_diff(abspath)
 end
 
---------------------------------------------------------------------------
--- in-buffer actions
---------------------------------------------------------------------------
+-- View-row index (1-based) of the cursor's current line, or nil for headers.
+local function cursor_row(buf)
+  local offset = vim.b[buf].diffview_offset or 0
+  local sline = vim.api.nvim_win_get_cursor(0)[1]
+  if sline <= offset then return nil end
+  return sline - offset
+end
+
+-- Revert an added line: delete it from the working file. Returns the new file
+-- content and the undo entry; nil content if the view is stale.
+local function revert_add(buf, abspath, r, idx)
+  local new_raw = read_file_raw(abspath)
+  local ls = new_raw and lines(new_raw) or {}
+  local content = r.text:sub(2)
+  local trailing_new = new_raw and new_raw:sub(-1) == '\n' or false
+  if ls[r.newln] ~= content then return nil, nil end
+  local out = edit_content(ls, 'delete', r.newln, nil, trailing_new, false, false)
+  local entry = { kind = 'add', pos = r.newln, before = new_raw, after = out }
+  return out, entry
+end
+
+-- Revert a removed line: restore it into the working file at the new-side
+-- position of its old line. The old-side number minus the deleted lines
+-- before it, plus the added lines before it (a surviving old line maps to
+-- one new line, and an added line also occupies one slot ahead of this line
+-- in the new file). Exact for every case — including end-of-file deletions,
+-- where vim.diff anchors the hunk at the new side's start, and del runs that
+-- follow earlier add hunks.
+local function revert_del(buf, abspath, rows, idx)
+  local r = rows[idx]
+  local toplevel = state.toplevel
+  local new_raw = read_file_raw(abspath)
+  local ls = new_raw and lines(new_raw) or {}
+  local content = r.text:sub(2)
+  local trailing_new = new_raw and new_raw:sub(-1) == '\n' or false
+
+  local dels_before, adds_before = 0, 0
+  for i = 1, idx - 1 do
+    local k = rows[i].kind
+    if k == 'del' then dels_before = dels_before + 1
+    elseif k == 'add' then adds_before = adds_before + 1 end
+  end
+  local pos = r.oldln - dels_before + adds_before
+  local at_end = pos == #ls + 1
+
+  -- stale-view guard: the new-side line at the insertion point must still
+  -- hold the content the view shows
+  local offset = vim.b[buf].diffview_offset or 0
+  for i, rr in ipairs(rows) do
+    if rr.newln == pos then
+      if ls[pos] ~= rr.text:sub(2) then return nil, nil end
+      break
+    end
+  end
+
+  local old_trailing = false
+  if at_end and not trailing_new then
+    local old_raw = git_show_raw(toplevel, relpath(toplevel, abspath))
+    old_trailing = old_raw and old_raw:sub(-1) == '\n' or false
+  end
+  local out = edit_content(ls, 'insert', pos, content, trailing_new, old_trailing, at_end)
+  local entry = { kind = 'del', pos = pos, old_line = r.oldln, before = new_raw, after = out }
+  return out, entry
+end
+
 -- dd: revert the change on the cursor line — an added line is deleted from
 -- the working file, a removed line is restored into it. The edit is written
 -- straight to disk (the view's source of truth), the view re-renders and the
@@ -863,71 +887,27 @@ function M.revert_line()
     vim.notify('diffview: cannot revert this view', vim.log.levels.WARN)
     return
   end
-  local offset = vim.b[buf].diffview_offset or 0
-  local kinds = vim.b[buf].diffview_kinds
-  local row = vim.api.nvim_win_get_cursor(0)[1] - offset
-  local k = kinds and kinds[row]
-  if k ~= 'add' and k ~= 'del' then
+  local rows = vim.b[buf].diffview_rows
+  local idx = cursor_row(buf)
+  local r = rows and idx and rows[idx]
+  if not r or (r.kind ~= 'add' and r.kind ~= 'del') then
     vim.notify('diffview: not on a changed line', vim.log.levels.WARN)
     return
   end
 
   local toplevel = state.toplevel
-  local new_raw = read_file_raw(abspath)
-  local ls = new_raw and lines(new_raw) or {}
-  local content = vim.api.nvim_buf_get_lines(buf, offset + row - 1, offset + row, false)[1]:sub(2)
-  local trailing_new = new_raw and new_raw:sub(-1) == '\n' or false
-  local function stale()
-    vim.notify('diffview: working file changed; reopen the view', vim.log.levels.WARN)
-  end
-
   local out, entry
-  if k == 'add' then
-    -- delete the added line from the working file
-    local line = vim.b[buf].diffview_map[row]
-    if ls[line] ~= content then return stale() end
-    out = edit_content(ls, 'delete', line, nil, trailing_new, false, false)
-    entry = { kind = 'add', pos = line, content = content, old_line = nil }
+  if r.kind == 'add' then
+    out, entry = revert_add(buf, abspath, r, idx)
   else
-    -- restore the removed line at the new-side position of its old line:
-    -- the old-side number minus the deleted lines before it, plus the added
-    -- lines before it (a surviving old line maps to one new line, and an
-    -- added line also occupies one slot ahead of this line in the new file).
-    -- Exact for every case — including end-of-file deletions, where vim.diff
-    -- anchors the hunk at the new side's start, and del runs that follow
-    -- earlier add hunks.
-    local L = vim.b[buf].diffview_oldmap[row]
-    local dels_before, adds_before = 0, 0
-    for i = 1, row - 1 do
-      if kinds[i] == 'del' then
-        dels_before = dels_before + 1
-      elseif kinds[i] == 'add' then
-        adds_before = adds_before + 1
-      end
-    end
-    local pos = L - dels_before + adds_before
-    local at_end = pos == #ls + 1
-    -- stale-view guard: the new-side line at the insertion point must still
-    -- hold the content the view shows
-    local anchor
-    for i = 1, #kinds do
-      if vim.b[buf].diffview_map[i] == pos then anchor = i break end
-    end
-    if anchor and ls[pos] ~= vim.api.nvim_buf_get_lines(buf, offset + anchor - 1, offset + anchor, false)[1]:sub(2) then
-      return stale()
-    end
-    local old_trailing = false
-    if at_end and not trailing_new then
-      local old_raw = git_show_raw(toplevel, relpath(toplevel, abspath))
-      old_trailing = old_raw and old_raw:sub(-1) == '\n' or false
-    end
-    out = edit_content(ls, 'insert', pos, content, trailing_new, old_trailing, at_end)
-    entry = { kind = 'del', pos = pos, content = content, old_line = vim.b[buf].diffview_oldmap[row] }
+    out, entry = revert_del(buf, abspath, rows, idx)
+  end
+  if not entry then
+    vim.notify('diffview: working file changed; reopen the view', vim.log.levels.WARN)
+    return
   end
 
   if not write_working_file(abspath, out) then return end
-  entry.before = new_raw -- nil when the file was absent
-  entry.after = out
   local stack = vim.b[buf].diffview_undo or {}
   stack[#stack + 1] = entry
   vim.b[buf].diffview_undo = stack
@@ -937,11 +917,11 @@ function M.revert_line()
   -- land the cursor on the next remaining change line. The re-render keeps
   -- the cursor's line number, so scan forward from there — the row under it
   -- may now hold the rest of the same hunk, which still counts as "next".
-  local kinds2 = vim.b[buf].diffview_kinds
+  local rows2 = vim.b[buf].diffview_rows
   local off2 = vim.b[buf].diffview_offset or 0
   for i = math.max(vim.api.nvim_win_get_cursor(0)[1], off2 + 1), vim.api.nvim_buf_line_count(buf) do
-    local kk = kinds2[i - off2]
-    if kk == 'add' or kk == 'del' then
+    local rr = rows2[i - off2]
+    if rr and (rr.kind == 'add' or rr.kind == 'del') then
       vim.api.nvim_win_set_cursor(0, { i, 0 })
       break
     end
@@ -977,18 +957,14 @@ function M.undo_revert()
   -- return the cursor to the reverted line: an added line is back as a
   -- context row carrying its new-side number; a removed line is a del row
   -- again under its old-side number.
-  local kinds = vim.b[buf].diffview_kinds
+  local rows = vim.b[buf].diffview_rows
   local offset = vim.b[buf].diffview_offset or 0
   local target
-  if entry.kind == 'add' then
-    local map = vim.b[buf].diffview_map
-    for i = 1, #map do
-      if map[i] == entry.pos then target = i break end
-    end
-  else
-    local oldmap = vim.b[buf].diffview_oldmap
-    for i = 1, #oldmap do
-      if kinds[i] == 'del' and oldmap[i] == entry.old_line then target = i break end
+  for i, r in ipairs(rows) do
+    if entry.kind == 'add' then
+      if r.newln == entry.pos then target = i; break end
+    else
+      if r.kind == 'del' and r.oldln == entry.old_line then target = i; break end
     end
   end
   if target then
@@ -999,10 +975,10 @@ end
 function M.jump_to_source()
   local buf = vim.api.nvim_get_current_buf()
   local abspath = vim.b[buf].diffview_abspath
-  local map = vim.b[buf].diffview_map
-  local offset = vim.b[buf].diffview_offset or 0
-  local row = vim.api.nvim_win_get_cursor(0)[1]
-  local target = map and map[row - offset]
+  local rows = vim.b[buf].diffview_rows
+  local idx = cursor_row(buf)
+  local r = rows and idx and rows[idx]
+  local target = r and r.newln
 
   -- open the real file in the current window, jumping to the new-side line
   vim.cmd('edit ' .. vim.fn.fnameescape(abspath))
@@ -1017,17 +993,17 @@ end
 function M.jump_hunk(dir)
   local buf = vim.api.nvim_get_current_buf()
   local offset = vim.b[buf].diffview_offset or 0
-  local kinds = vim.b[buf].diffview_kinds
+  local rows = vim.b[buf].diffview_rows
+  local total = vim.api.nvim_buf_line_count(buf)
   -- screen line -> view row index (1-based), nil for header rows
   local function row_of(sline)
     if sline <= offset then return nil end
     return sline - offset
   end
-  local function is_change(row)
-    return row and kinds and (kinds[row] == 'add' or kinds[row] == 'del')
+  local function is_change(ri)
+    return ri and rows and (rows[ri].kind == 'add' or rows[ri].kind == 'del')
   end
   local cur = vim.api.nvim_win_get_cursor(0)[1]
-  local total = vim.api.nvim_buf_line_count(buf)
   -- scan range: header lines (<= offset) are not content; when the cursor is
   -- in/above the header, start from the first view line (offset+1) going down,
   -- and never go up. Otherwise step off the current line.
@@ -1063,16 +1039,10 @@ function M._linecol()
   local lnum = vim.v.lnum
   local offset = vim.b.diffview_offset or 0
   if lnum <= offset then return '' end
-  local i = lnum - offset
-  local kinds = vim.b.diffview_kinds
-  local k = kinds and kinds[i]
-  if k == 'del' then
-    local oldmap = vim.b.diffview_oldmap
-    local n = oldmap and oldmap[i]
-    return n and tostring(n) or ''
-  end
-  local map = vim.b.diffview_map
-  local n = map and map[i]
+  local rows = vim.b.diffview_rows
+  local r = rows and rows[lnum - offset]
+  if not r then return '' end
+  local n = (r.kind == 'del') and r.oldln or r.newln
   return n and tostring(n) or ''
 end
 
@@ -1158,9 +1128,7 @@ end
 -- Pick the first modified file in a deterministic order (shortest relpath first).
 local function pick_first_modified(modified, toplevel)
   local paths = {}
-  for path in pairs(modified) do
-    paths[#paths + 1] = path
-  end
+  for path in pairs(modified) do paths[#paths + 1] = path end
   table.sort(paths, function(a, b)
     return relpath(toplevel, a) < relpath(toplevel, b)
   end)
@@ -1234,10 +1202,10 @@ function M.close()
       local ok, b = pcall(vim.api.nvim_win_get_buf, w)
       if ok and vim.bo[b].filetype == 'diffview' then
         reopen_path = vim.b[b].diffview_abspath
-        local map = vim.b[b].diffview_map
+        local rows = vim.b[b].diffview_rows
         local offset = vim.b[b].diffview_offset or 0
-        local row = vim.api.nvim_win_get_cursor(w)[1]
-        reopen_target = map and map[row - offset]
+        local idx = vim.api.nvim_win_get_cursor(w)[1] - offset
+        reopen_target = rows and rows[idx] and rows[idx].newln
         if reopen_path then
           vim.api.nvim_set_current_win(w)
           vim.cmd('edit ' .. vim.fn.fnameescape(reopen_path))
@@ -1271,11 +1239,7 @@ end
 
 -- Toggle the diff view: open if inactive, close if active.
 function M.toggle()
-  if state.active then
-    M.close()
-  else
-    M.open()
-  end
+  if state.active then M.close() else M.open() end
 end
 
 --------------------------------------------------------------------------
