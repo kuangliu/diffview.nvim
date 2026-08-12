@@ -583,6 +583,12 @@ local function setup_view_window(w)
   vim.wo[w].statuscolumn = '%s%=%{v:lua.require("diffview")._linecol()} '
   -- no folding: show the whole file with all context lines expanded.
   vim.wo[w].foldenable = false
+  -- The editor's global scrolloff=999 keeps the cursor centered, but it blocks
+  -- neoscroll's per-frame cursor movement: paging near the buffer edges stalls
+  -- the cursor mid-window and it never reaches the first/last line. The diff
+  -- view is a browsing surface, so give it a normal scrolloff — mid-file pages
+  -- still ride the cursor (it stays centered) while it can reach the edges.
+  vim.wo[w].scrolloff = 8
 end
 
 local function show_in_window(buf)
