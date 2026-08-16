@@ -15,8 +15,7 @@
 --                             to the next change.
 --   u                         Undo the last revert and jump back to its line.
 --   c                         Commit all modified files, from the diff buffer or the
---                             nvim-tree window (prompts for a commit message; with
---                             DeepSeek configured the message is AI-generated; closes
+--                             nvim-tree window (prompts for a commit message; closes
 --                             the view when nothing remains modified).
 --   D                         Confirm, revert the entire file, then show the next
 --                             modified file (closing the view when none remain).
@@ -74,19 +73,6 @@ local state = {
   buffers = {},         -- view bufnrs currently alive
 }
 
--- User configuration, merged in setup(). DeepSeek settings are used by `c`
--- to generate a commit message before the input prompt opens.
-local config = {
-  deepseek = {
-    api_key = nil,
-    model = 'deepseek-chat',
-    base_url = 'https://api.deepseek.com',
-    max_tokens = 1000,
-    temperature = 0.2,
-    max_diff_chars = 24000,
-    timeout = 30,
-  },
-}
 
 --------------------------------------------------------------------------
 -- git helpers
@@ -887,204 +873,10 @@ local function commit_all(toplevel, message)
   return out
 end
 
--- The configured DeepSeek API key; DEEPSEEK_API_KEY is a convenience
--- fallback when setup() did not provide one.
-local function deepseek_api_key()
-  local key = config.deepseek.api_key
-  if not key or key == '' then
-    -- DEEPSEER_API_KEY is a fallback for an old typo in some shell configs.
-    key = vim.env.DEEPSEEK_API_KEY or vim.env.DEEPSEER_API_KEY
-  end
-  return key
-end
-
--- Build a pseudo `git diff` for an untracked file so DeepSeek can describe
--- newly-created files too, not just their filename from `git status`.
-local function untracked_file_diff(toplevel, rel)
-  local raw = read_file_raw(toplevel .. '/' .. rel)
-  local header = 'diff --git a/' .. rel .. ' b/' .. rel .. '\nnew file mode 100644\n'
-  if raw == nil then
-    return header .. 'new file: ' .. rel
-  end
-  if raw:find('%z') then
-    return header .. 'Binary files /dev/null and b/' .. rel .. ' differ'
-  end
-  local ls = lines(raw)
-  local out = {
-    header .. '--- /dev/null\n+++ b/' .. rel,
-    '@@ -0,0 +1,' .. #ls .. ' @@',
-  }
-  for _, l in ipairs(ls) do out[#out + 1] = '+' .. l end
-  return table.concat(out, '\n')
-end
-
--- Snapshot the changes DeepSeek should summarise: git status, tracked
--- edits/deletions as a real diff, and the contents of untracked text files.
--- Returns nil when the repository has nothing to describe.
-local function commit_changes_for_ai(toplevel)
-  local parts = {}
-  local status = vim.fn.system({ 'git', '-C', toplevel, 'status', '--short' })
-  if vim.v.shell_error == 0 then
-    status = vim.trim(status)
-    if status ~= '' then parts[#parts + 1] = 'Git status:\n' .. status end
-  end
-
-  local diff = vim.fn.system({ 'git', '-C', toplevel, 'diff', 'HEAD', '--' })
-  if vim.v.shell_error == 0 and diff ~= '' then
-    parts[#parts + 1] = 'Git diff (working tree vs HEAD):\n' .. diff
-  end
-
-  local untracked = vim.fn.systemlist({ 'git', '-C', toplevel, 'ls-files', '--others', '--exclude-standard' })
-  local untracked_parts = {}
-  for _, rel in ipairs(untracked) do
-    if rel ~= '' then untracked_parts[#untracked_parts + 1] = untracked_file_diff(toplevel, rel) end
-  end
-  if #untracked_parts > 0 then
-    parts[#parts + 1] = 'Untracked file contents:\n\n' .. table.concat(untracked_parts, '\n\n')
-  end
-
-  if #parts == 0 then return nil end
-  local text = table.concat(parts, '\n\n')
-  local max_chars = config.deepseek.max_diff_chars or 24000
-  if #text > max_chars then text = text:sub(1, max_chars) .. '\n... (truncated)' end
-  return text
-end
-
--- Remove markdown fences, labels, and surrounding quotes that DeepSeek (or a
--- local proxy) commonly adds even when asked for the bare message.
-local function clean_commit_message(message)
-  message = vim.trim(message)
-  message = message:gsub('^```[%w_%-]*%s*\n', ''):gsub('\n```%s*$', '')
-  message = message:gsub('^%s*[Cc]ommit [Mm]essage:%s*', '')
-  message = message:gsub('^["“](.*)["”]$', '%1')
-  return vim.trim(message)
-end
-
-local function deepseek_endpoint(base_url)
-  base_url = (base_url or 'https://api.deepseek.com'):gsub('/+$', '')
-  if base_url:match('/chat/completions$') then return base_url end
-  return base_url .. '/chat/completions'
-end
-
--- Ask DeepSeek for a commit message, then invoke `callback(message)` with the
--- cleaned-up response (nil on failure). The prompt itself opens afterwards,
--- so the generated text is already sitting in the input box when it appears.
-local function generate_commit_message(toplevel, callback)
-  local api_key = vim.trim(deepseek_api_key() or '')
-  if api_key == '' then return callback(nil) end
-
-  local changes = commit_changes_for_ai(toplevel)
-  if not changes then return callback(nil) end
-
-  local system_prompt = 'You are an expert at writing concise git commit messages. '
-      .. 'Follow the Conventional Commits format (type(scope): subject). '
-      .. 'Keep the subject under 72 characters; add a short body only when '
-      .. 'the changes need more context. Return only the commit message: '
-      .. 'no explanation, no markdown fences, and no surrounding quotes.'
-
-  local function request(max_tokens)
-    local payload_table = {
-      model = config.deepseek.model or 'deepseek-chat',
-      stream = false,
-      max_tokens = max_tokens,
-      temperature = config.deepseek.temperature or 0.2,
-      messages = {
-        { role = 'system', content = system_prompt },
-        {
-          role = 'user',
-          content = 'Write a commit message for the following repository changes:\n\n' .. changes,
-        },
-      },
-    }
-
-    local ok, payload = pcall(vim.json.encode, payload_table)
-    if not ok then
-      return nil, 'failed to encode DeepSeek request: ' .. tostring(payload)
-    end
-
-    local cmd = {
-      'curl', '-sS', '--fail-with-body', '--max-time', tostring(config.deepseek.timeout or 30),
-      deepseek_endpoint(config.deepseek.base_url),
-      '-H', 'Content-Type: application/json',
-      '-H', 'Authorization: Bearer ' .. api_key,
-      '-d', payload,
-    }
-    local out = vim.fn.system(cmd)
-    if vim.v.shell_error ~= 0 then
-      local detail = vim.trim(out or '')
-      return nil, 'DeepSeek request failed' .. (detail ~= '' and (': ' .. detail) or '')
-    end
-
-    local decode_ok, decoded = pcall(vim.json.decode, out)
-    if not decode_ok then
-      return nil, 'DeepSeek returned invalid JSON'
-    end
-    return decoded
-  end
-
-  local function extract(decoded)
-    if type(decoded) ~= 'table' or type(decoded.choices) ~= 'table' then
-      return nil, nil, decoded
-    end
-    local first = decoded.choices[1]
-    if type(first) ~= 'table' or type(first.message) ~= 'table' then
-      return nil, nil, decoded
-    end
-    return first.message.content, first.finish_reason, decoded
-  end
-
-  vim.notify('diffview: generating commit message with DeepSeek...', vim.log.levels.INFO)
-
-  local max_tokens = config.deepseek.max_tokens or 1000
-  local decoded, err = request(max_tokens)
-  if not decoded then
-    vim.notify('diffview: ' .. err, vim.log.levels.ERROR)
-    return callback(nil)
-  end
-
-  local message, finish_reason = extract(decoded)
-
-  -- Reasoning models (deepseek-reasoner, deepseek-v4-flash, ...) spend their
-  -- token budget on reasoning_content first. If the final content came back
-  -- empty because the budget was exhausted, retry once with a much larger
-  -- budget instead of showing an empty prompt.
-  if finish_reason == 'length' and (type(message) ~= 'string' or vim.trim(message) == '') then
-    local retry_tokens = math.max(max_tokens * 4, 4096)
-    vim.notify('diffview: DeepSeek reasoning hit the token limit; retrying with '
-      .. retry_tokens .. ' tokens...', vim.log.levels.INFO)
-    decoded, err = request(retry_tokens)
-    if not decoded then
-      vim.notify('diffview: ' .. err, vim.log.levels.ERROR)
-      return callback(nil)
-    end
-    message = extract(decoded)
-  end
-
-  if type(message) ~= 'string' then
-    local api_error = type(decoded) == 'table'
-        and type(decoded.error) == 'table' and decoded.error.message or nil
-    vim.notify('diffview: DeepSeek returned no commit message'
-      .. (api_error and (': ' .. tostring(api_error)) or ''), vim.log.levels.WARN)
-    return callback(nil)
-  end
-
-  message = clean_commit_message(message)
-  if message == '' then
-    vim.notify('diffview: DeepSeek returned an empty commit message', vim.log.levels.WARN)
-    return callback(nil)
-  end
-  callback(message)
-end
-
 -- Open the commit-message input and run the actual git commit when the user
--- confirms. `default_message` is pre-filled when DeepSeek produced one.
-local function prompt_commit_message(toplevel, abspath, default_message)
-  local opts = { prompt = 'Commit message: ' }
-  if default_message and default_message ~= '' then
-    opts.default = default_message
-  end
-
-  vim.ui.input(opts, function(input)
+-- confirms.
+local function prompt_commit_message(toplevel, abspath)
+  vim.ui.input({ prompt = 'Commit message: ' }, function(input)
     if input == nil then return end -- cancelled
     local message = vim.trim(input)
     if message == '' then
@@ -1122,8 +914,7 @@ local function prompt_commit_message(toplevel, abspath, default_message)
   end)
 end
 
--- c: prompt for a commit message and commit all modified files. With DeepSeek
--- configured, the message is generated first and pre-fills the input box.
+-- c: prompt for a commit message and commit all modified files.
 function M.commit_changes()
   local buf = vim.api.nvim_get_current_buf()
   local abspath = vim.b[buf].diffview_abspath
@@ -1165,14 +956,7 @@ function M.commit_changes()
     return
   end
 
-  if deepseek_api_key() then
-    generate_commit_message(toplevel, function(message)
-      prompt_commit_message(toplevel, abspath, message)
-    end)
-  else
-    vim.notify('diffview: DeepSeek API key not configured; opening manual commit prompt', vim.log.levels.INFO)
-    prompt_commit_message(toplevel, abspath, nil)
-  end
+  prompt_commit_message(toplevel, abspath)
 end
 M.commit = M.commit_changes
 
@@ -1772,41 +1556,7 @@ end
 --------------------------------------------------------------------------
 -- setup
 --------------------------------------------------------------------------
--- opts = {
---   deepseek = {
---     api_key = 'sk-...',
---     model = 'deepseek-chat',           -- optional, default
---     base_url = 'https://api.deepseek.com', -- optional, default
---   },
--- }
--- Flat opts.deepseek_api_key / opts.deepseek_model / opts.deepseek_base_url
--- (and `ai = { ... }` as an alias for `deepseek`) are accepted too.
-function M.setup(opts)
-  opts = opts or {}
-  local ai = opts.deepseek or opts.ai
-  if ai then
-    config.deepseek = vim.tbl_deep_extend('force', config.deepseek, ai)
-  end
-  if type(opts.deepseek_api_key) == 'string' then
-    config.deepseek.api_key = opts.deepseek_api_key
-  end
-  if type(opts.deepseek_model) == 'string' then
-    config.deepseek.model = opts.deepseek_model
-  end
-  if type(opts.deepseek_base_url) == 'string' then
-    config.deepseek.base_url = opts.deepseek_base_url
-  end
-  -- Bare top-level aliases, for setups that prefer the shortest config form.
-  if type(opts.api_key) == 'string' then
-    config.deepseek.api_key = opts.api_key
-  end
-  if type(opts.model) == 'string' then
-    config.deepseek.model = opts.model
-  end
-  if type(opts.base_url) == 'string' then
-    config.deepseek.base_url = opts.base_url
-  end
-
+function M.setup()
   vim.api.nvim_create_user_command('DiffView', function() M.toggle() end, {})
   vim.keymap.set('n', '<Leader>dv', function() M.toggle() end, { desc = 'diffview: toggle' })
 
@@ -1824,6 +1574,5 @@ end
 
 -- Exposed for ad-hoc debugging from the command line.
 M.state = state
-M.config = config
 
 return M
