@@ -10,10 +10,17 @@
 --   q                        Close the view and reopen the shown source file.
 --   <CR>                     Open the source file at the cursor's line.
 --   ]] / [[                  Jump to the next / previous change hunk.
---   dd                        Revert the change on the cursor line (delete an
+--   d                         Revert the change on the cursor line (delete an
 --                             added line / restore a removed one), then jump
 --                             to the next change.
 --   u                         Undo the last revert and jump back to its line.
+--   c                         Commit all modified files, from the diff buffer or the
+--                             nvim-tree window (prompts for a commit message; with
+--                             DeepSeek configured the message is AI-generated; closes
+--                             the view when nothing remains modified).
+--   D                         Confirm, revert the entire file, then show the next
+--                             modified file (closing the view when none remain).
+--   <Tab>                    Switch the view to the next modified file.
 --
 -- The diff is one pane: context lines are prefixed with a space, added lines
 -- with `+` and removed with `-`, each tinted with a full-width background.
@@ -40,6 +47,8 @@ local KEEP = 8
 local MAX_WORD_PAIRS = 5000
 
 local OPEN_KEYS = { 'l', 'e', '<CR>' }
+local COMMIT_KEY = 'c'
+local TREE_HOTKEYS = { 'l', 'e', '<CR>', 'c' }
 
 -- A single view row. One list of these replaces the old parallel
 -- disp/map/oldmap/kinds arrays, so there is no nil-in-array juggling.
@@ -63,6 +72,20 @@ local state = {
   saved_clean = nil,    -- prior value of nvim-tree's git_clean filter
   saved_keymaps = {},   -- [bufnr] = { [key] = keymap_dict }
   buffers = {},         -- view bufnrs currently alive
+}
+
+-- User configuration, merged in setup(). DeepSeek settings are used by `c`
+-- to generate a commit message before the input prompt opens.
+local config = {
+  deepseek = {
+    api_key = nil,
+    model = 'deepseek-chat',
+    base_url = 'https://api.deepseek.com',
+    max_tokens = 1000,
+    temperature = 0.2,
+    max_diff_chars = 24000,
+    timeout = 30,
+  },
 }
 
 --------------------------------------------------------------------------
@@ -94,6 +117,24 @@ local function list_modified(toplevel)
     end
   end
   return set
+end
+
+-- Pick the modified file after `abspath` (shortest-relative-path order), so
+-- whole-file revert / commit / Tab navigation can move the view on to the
+-- next change. Wraps to the first remaining file when the reverted file was
+-- last; nil when none remain.
+local function next_modified_path(abspath)
+  local paths = {}
+  for p in pairs(state.modified) do paths[#paths + 1] = p end
+  if #paths == 0 then return nil end
+  table.sort(paths, function(a, b)
+    return relpath(state.toplevel, a) < relpath(state.toplevel, b)
+  end)
+  local rel = relpath(state.toplevel, abspath)
+  for _, p in ipairs(paths) do
+    if relpath(state.toplevel, p) > rel then return p end
+  end
+  return paths[1]
 end
 
 local function read_file_raw(path)
@@ -704,10 +745,16 @@ local function create_view_buf()
     { buffer = buf, silent = true, desc = 'diffview: next change' })
   vim.keymap.set('n', '[[', function() M.jump_hunk(-1) end,
     { buffer = buf, silent = true, desc = 'diffview: prev change' })
-  vim.keymap.set('n', 'dd', M.revert_line,
+  vim.keymap.set('n', 'd', M.revert_line,
     { buffer = buf, nowait = true, silent = true, desc = 'diffview: revert line change' })
   vim.keymap.set('n', 'u', M.undo_revert,
     { buffer = buf, nowait = true, silent = true, desc = 'diffview: undo revert' })
+  vim.keymap.set('n', 'c', M.commit_changes,
+    { buffer = buf, nowait = true, silent = true, desc = 'diffview: commit changes' })
+  vim.keymap.set('n', 'D', M.revert_file,
+    { buffer = buf, nowait = true, silent = true, desc = 'diffview: revert file changes' })
+  vim.keymap.set('n', '<Tab>', M.next_file,
+    { buffer = buf, nowait = true, silent = true, desc = 'diffview: next modified file' })
 
   state.buffers[#state.buffers + 1] = buf
   vim.api.nvim_create_autocmd('BufWipeout', {
@@ -738,14 +785,14 @@ local function open_diff(abspath)
   end
 
   local buf = find_view_buf(abspath) or create_view_buf()
-  vim.b[buf].diffview_binary = binary -- blocks dd on binary files
+  vim.b[buf].diffview_binary = binary -- blocks d on binary files
   render(buf, abspath, rel, rows, counts)
   apply_treesitter(buf, abspath, rows, old_raw, new_raw)
   show_in_window(buf)
 end
 
 --------------------------------------------------------------------------
--- working-tree edits (dd / u)
+-- working-tree edits (d / u)
 --------------------------------------------------------------------------
 -- Apply one line edit to the working file's line list and return the new
 -- content ('delete' removes the line at `at`, 'insert' puts `content` there,
@@ -815,6 +862,320 @@ local function after_edit(abspath)
   open_diff(abspath)
 end
 
+--------------------------------------------------------------------------
+-- commit (c)
+--------------------------------------------------------------------------
+-- Run git with a list argv so the commit message is one argument (no shell
+-- quoting issues). Returns the shell exit code and the command output.
+local function run_git(args)
+  local out = vim.fn.system(args)
+  return vim.v.shell_error, out
+end
+
+-- Stage and commit every working-tree change shown by the view. `git add
+-- --all` matches list_modified()'s notion of dirty: tracked modifications and
+-- deletions plus untracked, non-ignored files.
+local function commit_all(toplevel, message)
+  local code, out = run_git({ 'git', '-C', toplevel, 'add', '--all' })
+  if code ~= 0 then
+    return nil, 'git add failed: ' .. vim.trim(out)
+  end
+  code, out = run_git({ 'git', '-C', toplevel, 'commit', '-m', message })
+  if code ~= 0 then
+    return nil, 'git commit failed: ' .. vim.trim(out)
+  end
+  return out
+end
+
+-- The configured DeepSeek API key; DEEPSEEK_API_KEY is a convenience
+-- fallback when setup() did not provide one.
+local function deepseek_api_key()
+  local key = config.deepseek.api_key
+  if not key or key == '' then
+    -- DEEPSEER_API_KEY is a fallback for an old typo in some shell configs.
+    key = vim.env.DEEPSEEK_API_KEY or vim.env.DEEPSEER_API_KEY
+  end
+  return key
+end
+
+-- Build a pseudo `git diff` for an untracked file so DeepSeek can describe
+-- newly-created files too, not just their filename from `git status`.
+local function untracked_file_diff(toplevel, rel)
+  local raw = read_file_raw(toplevel .. '/' .. rel)
+  local header = 'diff --git a/' .. rel .. ' b/' .. rel .. '\nnew file mode 100644\n'
+  if raw == nil then
+    return header .. 'new file: ' .. rel
+  end
+  if raw:find('%z') then
+    return header .. 'Binary files /dev/null and b/' .. rel .. ' differ'
+  end
+  local ls = lines(raw)
+  local out = {
+    header .. '--- /dev/null\n+++ b/' .. rel,
+    '@@ -0,0 +1,' .. #ls .. ' @@',
+  }
+  for _, l in ipairs(ls) do out[#out + 1] = '+' .. l end
+  return table.concat(out, '\n')
+end
+
+-- Snapshot the changes DeepSeek should summarise: git status, tracked
+-- edits/deletions as a real diff, and the contents of untracked text files.
+-- Returns nil when the repository has nothing to describe.
+local function commit_changes_for_ai(toplevel)
+  local parts = {}
+  local status = vim.fn.system({ 'git', '-C', toplevel, 'status', '--short' })
+  if vim.v.shell_error == 0 then
+    status = vim.trim(status)
+    if status ~= '' then parts[#parts + 1] = 'Git status:\n' .. status end
+  end
+
+  local diff = vim.fn.system({ 'git', '-C', toplevel, 'diff', 'HEAD', '--' })
+  if vim.v.shell_error == 0 and diff ~= '' then
+    parts[#parts + 1] = 'Git diff (working tree vs HEAD):\n' .. diff
+  end
+
+  local untracked = vim.fn.systemlist({ 'git', '-C', toplevel, 'ls-files', '--others', '--exclude-standard' })
+  local untracked_parts = {}
+  for _, rel in ipairs(untracked) do
+    if rel ~= '' then untracked_parts[#untracked_parts + 1] = untracked_file_diff(toplevel, rel) end
+  end
+  if #untracked_parts > 0 then
+    parts[#parts + 1] = 'Untracked file contents:\n\n' .. table.concat(untracked_parts, '\n\n')
+  end
+
+  if #parts == 0 then return nil end
+  local text = table.concat(parts, '\n\n')
+  local max_chars = config.deepseek.max_diff_chars or 24000
+  if #text > max_chars then text = text:sub(1, max_chars) .. '\n... (truncated)' end
+  return text
+end
+
+-- Remove markdown fences, labels, and surrounding quotes that DeepSeek (or a
+-- local proxy) commonly adds even when asked for the bare message.
+local function clean_commit_message(message)
+  message = vim.trim(message)
+  message = message:gsub('^```[%w_%-]*%s*\n', ''):gsub('\n```%s*$', '')
+  message = message:gsub('^%s*[Cc]ommit [Mm]essage:%s*', '')
+  message = message:gsub('^["“](.*)["”]$', '%1')
+  return vim.trim(message)
+end
+
+local function deepseek_endpoint(base_url)
+  base_url = (base_url or 'https://api.deepseek.com'):gsub('/+$', '')
+  if base_url:match('/chat/completions$') then return base_url end
+  return base_url .. '/chat/completions'
+end
+
+-- Ask DeepSeek for a commit message, then invoke `callback(message)` with the
+-- cleaned-up response (nil on failure). The prompt itself opens afterwards,
+-- so the generated text is already sitting in the input box when it appears.
+local function generate_commit_message(toplevel, callback)
+  local api_key = vim.trim(deepseek_api_key() or '')
+  if api_key == '' then return callback(nil) end
+
+  local changes = commit_changes_for_ai(toplevel)
+  if not changes then return callback(nil) end
+
+  local system_prompt = 'You are an expert at writing concise git commit messages. '
+      .. 'Follow the Conventional Commits format (type(scope): subject). '
+      .. 'Keep the subject under 72 characters; add a short body only when '
+      .. 'the changes need more context. Return only the commit message: '
+      .. 'no explanation, no markdown fences, and no surrounding quotes.'
+
+  local function request(max_tokens)
+    local payload_table = {
+      model = config.deepseek.model or 'deepseek-chat',
+      stream = false,
+      max_tokens = max_tokens,
+      temperature = config.deepseek.temperature or 0.2,
+      messages = {
+        { role = 'system', content = system_prompt },
+        {
+          role = 'user',
+          content = 'Write a commit message for the following repository changes:\n\n' .. changes,
+        },
+      },
+    }
+
+    local ok, payload = pcall(vim.json.encode, payload_table)
+    if not ok then
+      return nil, 'failed to encode DeepSeek request: ' .. tostring(payload)
+    end
+
+    local cmd = {
+      'curl', '-sS', '--fail-with-body', '--max-time', tostring(config.deepseek.timeout or 30),
+      deepseek_endpoint(config.deepseek.base_url),
+      '-H', 'Content-Type: application/json',
+      '-H', 'Authorization: Bearer ' .. api_key,
+      '-d', payload,
+    }
+    local out = vim.fn.system(cmd)
+    if vim.v.shell_error ~= 0 then
+      local detail = vim.trim(out or '')
+      return nil, 'DeepSeek request failed' .. (detail ~= '' and (': ' .. detail) or '')
+    end
+
+    local decode_ok, decoded = pcall(vim.json.decode, out)
+    if not decode_ok then
+      return nil, 'DeepSeek returned invalid JSON'
+    end
+    return decoded
+  end
+
+  local function extract(decoded)
+    if type(decoded) ~= 'table' or type(decoded.choices) ~= 'table' then
+      return nil, nil, decoded
+    end
+    local first = decoded.choices[1]
+    if type(first) ~= 'table' or type(first.message) ~= 'table' then
+      return nil, nil, decoded
+    end
+    return first.message.content, first.finish_reason, decoded
+  end
+
+  vim.notify('diffview: generating commit message with DeepSeek...', vim.log.levels.INFO)
+
+  local max_tokens = config.deepseek.max_tokens or 1000
+  local decoded, err = request(max_tokens)
+  if not decoded then
+    vim.notify('diffview: ' .. err, vim.log.levels.ERROR)
+    return callback(nil)
+  end
+
+  local message, finish_reason = extract(decoded)
+
+  -- Reasoning models (deepseek-reasoner, deepseek-v4-flash, ...) spend their
+  -- token budget on reasoning_content first. If the final content came back
+  -- empty because the budget was exhausted, retry once with a much larger
+  -- budget instead of showing an empty prompt.
+  if finish_reason == 'length' and (type(message) ~= 'string' or vim.trim(message) == '') then
+    local retry_tokens = math.max(max_tokens * 4, 4096)
+    vim.notify('diffview: DeepSeek reasoning hit the token limit; retrying with '
+      .. retry_tokens .. ' tokens...', vim.log.levels.INFO)
+    decoded, err = request(retry_tokens)
+    if not decoded then
+      vim.notify('diffview: ' .. err, vim.log.levels.ERROR)
+      return callback(nil)
+    end
+    message = extract(decoded)
+  end
+
+  if type(message) ~= 'string' then
+    local api_error = type(decoded) == 'table'
+        and type(decoded.error) == 'table' and decoded.error.message or nil
+    vim.notify('diffview: DeepSeek returned no commit message'
+      .. (api_error and (': ' .. tostring(api_error)) or ''), vim.log.levels.WARN)
+    return callback(nil)
+  end
+
+  message = clean_commit_message(message)
+  if message == '' then
+    vim.notify('diffview: DeepSeek returned an empty commit message', vim.log.levels.WARN)
+    return callback(nil)
+  end
+  callback(message)
+end
+
+-- Open the commit-message input and run the actual git commit when the user
+-- confirms. `default_message` is pre-filled when DeepSeek produced one.
+local function prompt_commit_message(toplevel, abspath, default_message)
+  local opts = { prompt = 'Commit message: ' }
+  if default_message and default_message ~= '' then
+    opts.default = default_message
+  end
+
+  vim.ui.input(opts, function(input)
+    if input == nil then return end -- cancelled
+    local message = vim.trim(input)
+    if message == '' then
+      vim.notify('diffview: commit message cannot be empty', vim.log.levels.WARN)
+      return
+    end
+
+    local _, err = commit_all(toplevel, message)
+    if err then
+      vim.notify('diffview: ' .. err, vim.log.levels.ERROR)
+      return
+    end
+
+    vim.notify('diffview: committed changes', vim.log.levels.INFO)
+
+    state.modified = list_modified(toplevel)
+
+    -- The view may have been closed while the prompt was open; only refresh
+    -- the still-active view, otherwise close() has already restored the tree.
+    if state.active and state.toplevel == toplevel then
+      -- every file in the view may have changed state, not just the current one
+      pcall(function() get_api().tree.reload() end)
+
+      -- After committing, the current file is clean. Move to the next
+      -- remaining modified file instead of showing an ordinary clean file;
+      -- close the review session when everything has been committed.
+      local next_path = next_modified_path(abspath)
+      if next_path then
+        open_diff(next_path)
+        pcall(function() get_api().tree.find_file(next_path) end)
+      else
+        M.close()
+      end
+    end
+  end)
+end
+
+-- c: prompt for a commit message and commit all modified files. With DeepSeek
+-- configured, the message is generated first and pre-fills the input box.
+function M.commit_changes()
+  local buf = vim.api.nvim_get_current_buf()
+  local abspath = vim.b[buf].diffview_abspath
+  local toplevel = state.toplevel
+
+  -- `c` is also hijacked in the nvim-tree window while the view is active.
+  -- Resolve the currently shown diff file from a visible view buffer so the
+  -- commit prompt and post-commit navigation work from either window.
+  if not abspath then
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_is_valid(w) then
+        local wb = vim.api.nvim_win_get_buf(w)
+        if vim.bo[wb].filetype == 'diffview' and vim.b[wb].diffview_abspath then
+          abspath = vim.b[wb].diffview_abspath
+          break
+        end
+      end
+    end
+  end
+  if not abspath then
+    for _, b in ipairs(state.buffers) do
+      if vim.api.nvim_buf_is_valid(b) and vim.b[b].diffview_abspath then
+        abspath = vim.b[b].diffview_abspath
+        break
+      end
+    end
+  end
+
+  if not abspath or not toplevel then
+    vim.notify('diffview: cannot commit from this buffer', vim.log.levels.WARN)
+    return
+  end
+
+  -- Re-scan here instead of trusting state.modified, so changes made outside
+  -- the view are picked up and the empty-check never blocks a real commit.
+  state.modified = list_modified(toplevel)
+  if vim.tbl_isempty(state.modified) then
+    vim.notify('diffview: no changes to commit', vim.log.levels.INFO)
+    return
+  end
+
+  if deepseek_api_key() then
+    generate_commit_message(toplevel, function(message)
+      prompt_commit_message(toplevel, abspath, message)
+    end)
+  else
+    vim.notify('diffview: DeepSeek API key not configured; opening manual commit prompt', vim.log.levels.INFO)
+    prompt_commit_message(toplevel, abspath, nil)
+  end
+end
+M.commit = M.commit_changes
+
 -- View-row index (1-based) of the cursor's current line, or nil for headers.
 local function cursor_row(buf)
   local offset = vim.b[buf].diffview_offset or 0
@@ -880,7 +1241,7 @@ local function revert_del(buf, abspath, rows, idx)
   return out, entry
 end
 
--- dd: revert the change on the cursor line — an added line is deleted from
+-- d: revert the change on the cursor line — an added line is deleted from
 -- the working file, a removed line is restored into it. The edit is written
 -- straight to disk (the view's source of truth), the view re-renders and the
 -- cursor moves to the next remaining change line. Each edit is pushed onto
@@ -934,10 +1295,10 @@ function M.revert_line()
   end
 end
 
--- u: reverse the most recent dd. The working file must still match the
+-- u: reverse the most recent d. The working file must still match the
 -- recorded after-state (otherwise the entry is stale and gets dropped); it is
 -- then restored to the exact recorded before-state. The cursor returns to
--- the row the dd touched.
+-- the row the d touched.
 function M.undo_revert()
   local buf = vim.api.nvim_get_current_buf()
   local stack = vim.b[buf].diffview_undo
@@ -1067,21 +1428,27 @@ local function hijack(buf)
       buffer = buf, nowait = true, silent = true, desc = 'diffview: open diff',
     })
   end
+  vim.keymap.set('n', COMMIT_KEY, function() M.commit_changes() end, {
+    buffer = buf, nowait = true, silent = true, desc = 'diffview: commit changes',
+  })
+end
+
+local function restore_key(buf, key)
+  pcall(vim.keymap.del, 'n', key, { buffer = buf })
+  local m = state.saved_keymaps[buf] and state.saved_keymaps[buf][key]
+  if m then
+    if m.callback then
+      vim.keymap.set('n', key, m.callback, { buffer = buf, nowait = true, silent = true })
+    elseif m.rhs and m.rhs ~= '' then
+      vim.api.nvim_buf_set_keymap(buf, 'n', key, m.rhs, { nowait = true, silent = true })
+    end
+  end
 end
 
 local function restore(buf)
-  local saved = state.saved_keymaps[buf]
-  if not saved then return end
-  for _, key in ipairs(OPEN_KEYS) do
-    pcall(vim.keymap.del, 'n', key, { buffer = buf })
-    local m = saved[key]
-    if m then
-      if m.callback then
-        vim.keymap.set('n', key, m.callback, { buffer = buf, nowait = true, silent = true })
-      elseif m.rhs and m.rhs ~= '' then
-        vim.api.nvim_buf_set_keymap(buf, 'n', key, m.rhs, { nowait = true, silent = true })
-      end
-    end
+  if not state.saved_keymaps[buf] then return end
+  for _, key in ipairs(TREE_HOTKEYS) do
+    restore_key(buf, key)
   end
   state.saved_keymaps[buf] = nil
 end
@@ -1099,6 +1466,160 @@ function M.open_under_cursor()
   else
     get_api().node.open.edit() -- fallback: open the raw file
   end
+end
+
+local function git_file_in_head(toplevel, rel)
+  vim.fn.system({ 'git', '-C', toplevel, 'cat-file', '-e', 'HEAD:' .. rel })
+  return vim.v.shell_error == 0
+end
+
+local function git_file_in_index(toplevel, rel)
+  vim.fn.system({ 'git', '-C', toplevel, 'ls-files', '--error-unmatch', '--', rel })
+  return vim.v.shell_error == 0
+end
+
+-- Shared whole-file revert: discard every change for `path`. Tracked files
+-- are restored to HEAD (index and working tree), staged new files are removed
+-- with `git rm -f`, and untracked files are deleted from the filesystem.
+-- Confirm() leaves its prompt in the message area; notifying in the same
+-- event tick makes Vim show the "Press ENTER" hit-enter prompt. Schedule the
+-- follow-up notification so the confirmation prompt has cleared first.
+local function notify_later(msg, level)
+  vim.schedule(function() vim.notify(msg, level) end)
+end
+
+local function revert_file(path)
+  local toplevel = state.toplevel
+  local rel = relpath(toplevel, path)
+  if not state.modified[path] then
+    notify_later('diffview: file has no changes to revert', vim.log.levels.INFO)
+    return
+  end
+
+  local out, success
+  if git_file_in_head(toplevel, rel) then
+    out = vim.fn.system({ 'git', '-C', toplevel, 'checkout', 'HEAD', '--', rel })
+    success = vim.v.shell_error == 0
+  elseif git_file_in_index(toplevel, rel) then
+    out = vim.fn.system({ 'git', '-C', toplevel, 'rm', '-f', '--', rel })
+    success = vim.v.shell_error == 0
+  else
+    local ok, err = os.remove(path)
+    out = ok and '' or tostring(err)
+    success = ok ~= nil
+  end
+
+  if not success then
+    local detail = vim.trim(out or '')
+    notify_later('diffview: failed to revert ' .. rel
+      .. (detail ~= '' and (': ' .. detail) or ''), vim.log.levels.ERROR)
+    return
+  end
+
+  -- Defer every message-producing step until after the confirm() prompt has
+  -- been cleared from the message area. Running nvim-tree reload/open_diff
+  -- synchronously here is what caused the hit-enter prompt on the second
+  -- consecutive D in a row.
+  vim.schedule(function()
+    reload_open_buffers(path)
+    refresh_modified(path)
+
+    -- Move the view to the next remaining modified file. Re-rendering the
+    -- reverted file would show a clean ordinary file, which is not useful in
+    -- review mode; close the view instead when nothing is left to review.
+    local next_path = next_modified_path(path)
+    if next_path then
+      open_diff(next_path)
+      pcall(function() get_api().tree.find_file(next_path) end)
+    else
+      M.close()
+    end
+
+    notify_later('diffview: reverted ' .. rel, vim.log.levels.INFO)
+  end)
+end
+
+-- D (in the diffview buffer): ask for confirmation, then revert the whole
+-- file currently shown. Choosing anything other than Yes is a no-op.
+function M.revert_file()
+  local buf = vim.api.nvim_get_current_buf()
+  local abspath = vim.b[buf].diffview_abspath
+  local toplevel = state.toplevel
+  if not abspath or not toplevel then
+    vim.notify('diffview: cannot revert this buffer', vim.log.levels.WARN)
+    return
+  end
+
+  local choice = vim.fn.confirm(
+    'diffview: revert entire file ' .. relpath(toplevel, abspath) .. '?',
+    '&Yes\n&No',
+    2, -- default to No: dismissing the prompt must never destroy changes
+    'Question'
+  )
+  if choice == 1 then
+    revert_file(abspath)
+  end
+end
+
+-- <Tab> (in the diffview buffer): switch to the next modified file instead
+-- of opening an ordinary clean file. Wraps around at the end of the list.
+function M.next_file()
+  local buf = vim.api.nvim_get_current_buf()
+  local abspath = vim.b[buf].diffview_abspath
+  local toplevel = state.toplevel
+  if not abspath or not toplevel then
+    vim.notify('diffview: cannot switch files from this buffer', vim.log.levels.WARN)
+    return
+  end
+  if vim.tbl_isempty(state.modified) then
+    vim.notify('diffview: no modified files', vim.log.levels.INFO)
+    return
+  end
+
+  local target = next_modified_path(abspath)
+  if not target or target == abspath then
+    vim.notify('diffview: no other modified files', vim.log.levels.INFO)
+    return
+  end
+
+  open_diff(target)
+  pcall(function() get_api().tree.find_file(target) end)
+end
+M.next_modified_file = M.next_file
+
+-- Programmatic equivalent for nvim-tree workflows; not bound to a key by
+-- default. Kept for compatibility with callers that already used the earlier
+-- d-in-tree binding.
+function M.revert_file_under_cursor()
+  if not state.active or not state.toplevel then
+    vim.notify('diffview: view is not active', vim.log.levels.WARN)
+    return
+  end
+
+  local node = get_api().tree.get_node_under_cursor()
+  if not node then
+    vim.notify('diffview: no file under cursor', vim.log.levels.WARN)
+    return
+  end
+  if node.type == 'directory' then
+    vim.notify('diffview: cannot revert a directory', vim.log.levels.WARN)
+    return
+  end
+
+  local path = node.absolute_path
+  if not path then
+    vim.notify('diffview: no file under cursor', vim.log.levels.WARN)
+    return
+  end
+
+  local tree_win = vim.api.nvim_get_current_win()
+  revert_file(path)
+  -- revert_file refreshes the view asynchronously; restore focus after it.
+  vim.schedule(function()
+    if vim.api.nvim_win_is_valid(tree_win) then
+      vim.api.nvim_set_current_win(tree_win)
+    end
+  end)
 end
 
 --------------------------------------------------------------------------
@@ -1251,7 +1772,41 @@ end
 --------------------------------------------------------------------------
 -- setup
 --------------------------------------------------------------------------
-function M.setup()
+-- opts = {
+--   deepseek = {
+--     api_key = 'sk-...',
+--     model = 'deepseek-chat',           -- optional, default
+--     base_url = 'https://api.deepseek.com', -- optional, default
+--   },
+-- }
+-- Flat opts.deepseek_api_key / opts.deepseek_model / opts.deepseek_base_url
+-- (and `ai = { ... }` as an alias for `deepseek`) are accepted too.
+function M.setup(opts)
+  opts = opts or {}
+  local ai = opts.deepseek or opts.ai
+  if ai then
+    config.deepseek = vim.tbl_deep_extend('force', config.deepseek, ai)
+  end
+  if type(opts.deepseek_api_key) == 'string' then
+    config.deepseek.api_key = opts.deepseek_api_key
+  end
+  if type(opts.deepseek_model) == 'string' then
+    config.deepseek.model = opts.deepseek_model
+  end
+  if type(opts.deepseek_base_url) == 'string' then
+    config.deepseek.base_url = opts.deepseek_base_url
+  end
+  -- Bare top-level aliases, for setups that prefer the shortest config form.
+  if type(opts.api_key) == 'string' then
+    config.deepseek.api_key = opts.api_key
+  end
+  if type(opts.model) == 'string' then
+    config.deepseek.model = opts.model
+  end
+  if type(opts.base_url) == 'string' then
+    config.deepseek.base_url = opts.base_url
+  end
+
   vim.api.nvim_create_user_command('DiffView', function() M.toggle() end, {})
   vim.keymap.set('n', '<Leader>dv', function() M.toggle() end, { desc = 'diffview: toggle' })
 
@@ -1269,5 +1824,6 @@ end
 
 -- Exposed for ad-hoc debugging from the command line.
 M.state = state
+M.config = config
 
 return M
